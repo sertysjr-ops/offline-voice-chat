@@ -1,0 +1,7 @@
+.venv/
+models/
+voices/
+test/
+out.wav
+__pycache__/
+.DS_Store
