@@ -1,7 +1,7 @@
+__pycache__/
+*.pyc
 .venv/
 models/
 voices/
-test/
-out.wav
-__pycache__/
-.DS_Store
+test/*.wav
+test/*.aiff
