@@ -3,5 +3,6 @@ __pycache__/
 .venv/
 models/
 voices/
+data/
 test/*.wav
 test/*.aiff

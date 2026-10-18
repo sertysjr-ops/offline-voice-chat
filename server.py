@@ -4,8 +4,10 @@
 Serves a single-page browser UI and the voice pipeline API:
 
     GET  /                 → index.html
-    POST /api/talk         → JSON {audio: base64 16kHz mono wav, history?: [...]}
-                             → {transcript, reply, audio: base64 wav}
+    POST /api/talk         → JSON {audio: base64 16kHz mono wav, session?: "id"}
+                             → {transcript, reply, audio: base64 wav, turns}
+    POST /api/ask          → JSON {text, session?} → {reply, audio, turns}
+    POST /api/clear        → JSON {session} → {ok}   (wipe conversation)
 
 Models load lazily on first request (whisper + piper take a few seconds).
 
@@ -84,6 +86,18 @@ def talk(audio_b64, history):
     return {"transcript": transcript, "reply": reply, "audio": audio_b64_out}
 
 
+def _resolve_history(payload):
+    """Server-side session memory wins; client-sent history is the fallback.
+
+    Returns (history_for_llm, session_id_or_None).
+    """
+    import sessions
+    sid = (payload.get("session") or "").strip() or None
+    if sid:
+        return sessions.get_history(sid), sid
+    return payload.get("history") or None, None
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet
         pass
@@ -114,6 +128,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, '{"error": "bad json"}')
             return
 
+        if self.path == "/api/clear":
+            sid = (payload.get("session") or "").strip()
+            if not sid:
+                self._send(400, '{"error": "session required"}')
+                return
+            import sessions
+            sessions.clear(sid)
+            self._send(200, json.dumps({"ok": True, "session": sid, "turns": 0}))
+            return
+
         if self.path == "/api/ask":
             # text-only path: skip STT, LLM → TTS
             text = (payload.get("text") or "").strip()
@@ -123,14 +147,19 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 import tempfile
                 from brain import ask
-                reply = ask(text, history=payload.get("history") or None)
+                history, sid = _resolve_history(payload)
+                reply = ask(text, history=history)
                 out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                 out.close()
                 with _lock:
                     path, _dur = synthesize(reply, out.name)
                 with open(path, "rb") as f:
                     audio_b64 = base64.b64encode(f.read()).decode()
-                self._send(200, json.dumps({"reply": reply, "audio": audio_b64}))
+                import sessions
+                n = sessions.append_turn(sid, text, reply) if sid else 0
+                self._send(200, json.dumps({
+                    "reply": reply, "audio": audio_b64, "turns": n // 2,
+                }))
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}))
             return
@@ -139,7 +168,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, '{"error": "not found"}')
             return
         try:
-            result = talk(payload["audio"], payload.get("history") or [])
+            history, sid = _resolve_history(payload)
+            result = talk(payload["audio"], history)
+            if sid and result.get("transcript"):
+                import sessions
+                n = sessions.append_turn(sid, result["transcript"], result["reply"])
+                result["turns"] = n // 2
             self._send(200, json.dumps(result))
         except Exception as e:
             self._send(500, json.dumps({"error": str(e)}))

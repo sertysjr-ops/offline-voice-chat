@@ -93,6 +93,53 @@ def main():
             capture_output=True, text=True).stdout
         assert "<title>Hermes Voice" in html, "index.html not served"
         print("✅ /api/ask + index.html PASS")
+
+        # --- server-side session memory ---
+        sid = "test-session-1"
+        r1 = subprocess.run(
+            ["curl", "-s", "-m", "120", "-X", "POST",
+             f"http://127.0.0.1:{port}/api/ask",
+             "-H", "Content-Type: application/json",
+             "-d", json.dumps({"text": "Remember this codeword: ZEBRA.",
+                               "session": sid})],
+            capture_output=True, text=True).stdout
+        d1 = json.loads(r1)
+        assert d1.get("reply") and d1.get("turns") == 1, f"turn 1 failed: {r1[:200]}"
+        print(f"✅ session turn 1 — turns={d1['turns']}")
+
+        r2 = subprocess.run(
+            ["curl", "-s", "-m", "120", "-X", "POST",
+             f"http://127.0.0.1:{port}/api/ask",
+             "-H", "Content-Type: application/json",
+             "-d", json.dumps({"text": "What is the codeword I gave you? Answer with just the codeword.",
+                               "session": sid})],
+            capture_output=True, text=True).stdout
+        d2 = json.loads(r2)
+        assert d2.get("turns") == 2, f"turn count wrong: {r2[:200]}"
+        assert "zebra" in d2["reply"].lower(), \
+            f"memory failed — reply has no codeword: {d2['reply'][:160]!r}"
+        print(f"✅ session memory works — reply recalls codeword: {d2['reply'][:60]!r}")
+
+        # /api/clear wipes it
+        rc = subprocess.run(
+            ["curl", "-s", "-m", "10", "-X", "POST",
+             f"http://127.0.0.1:{port}/api/clear",
+             "-H", "Content-Type: application/json",
+             "-d", json.dumps({"session": sid})],
+            capture_output=True, text=True).stdout
+        dc = json.loads(rc)
+        assert dc.get("ok") is True, f"clear failed: {rc[:200]}"
+
+        r3 = subprocess.run(
+            ["curl", "-s", "-m", "120", "-X", "POST",
+             f"http://127.0.0.1:{port}/api/ask",
+             "-H", "Content-Type: application/json",
+             "-d", json.dumps({"text": "What is the codeword I gave you? Answer with just the codeword.",
+                               "session": sid})],
+            capture_output=True, text=True).stdout
+        d3 = json.loads(r3)
+        assert d3.get("turns") == 1, f"clear did not wipe history: {r3[:200]}"
+        print("✅ /api/clear wipes session memory")
         return 0
     finally:
         proc.kill()
