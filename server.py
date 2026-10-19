@@ -4,8 +4,11 @@
 Serves a single-page browser UI and the voice pipeline API:
 
     GET  /                 → index.html
-    POST /api/talk         → JSON {audio: base64 16kHz mono wav, session?: "id"}
+    POST /api/talk         → JSON {audio: base64 16kHz mono wav, session?: "id",
+                             handsFree?: bool, wakeWords?: string[]}
                              → {transcript, reply, audio: base64 wav, turns}
+                             handsFree on + no wake word →
+                             {transcript, wakeWordHit: false, reply: null, audio: null}
     POST /api/ask          → JSON {text, session?} → {reply, audio, turns}
     POST /api/clear        → JSON {session} → {ok}   (wipe conversation)
 
@@ -47,11 +50,18 @@ def synthesize(text, out_path):
     return tts_mod.synthesize(text, out_path)
 
 
-def talk(audio_b64, history):
-    """Full pipeline: wav → STT → LLM → TTS. Returns dict."""
+def talk(audio_b64, history, hands_free=False, wake_words=None):
+    """Full pipeline: wav → STT → [wake-word gate] → LLM → TTS.
+
+    With hands_free on, a transcript without a wake word returns early:
+    {transcript, wakeWordHit: false, reply: null, audio: None} — no LLM call,
+    no TTS, sub-second response. The wake word is stripped before the LLM
+    sees the command.
+    """
     import tempfile
     import numpy as np
     from brain import ask
+    from wakeword import WAKE_WORDS, match_wake_word
 
     wav_bytes = base64.b64decode(audio_b64)
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
@@ -73,6 +83,18 @@ def talk(audio_b64, history):
 
     if not transcript:
         return {"transcript": "", "reply": "I didn't catch that — try again.", "audio": None}
+
+    if hands_free:
+        matched, command = match_wake_word(transcript, wake_words or WAKE_WORDS)
+        if not matched:
+            return {
+                "transcript": transcript,
+                "wakeWordHit": False,
+                "reply": None,
+                "audio": None,
+            }
+        if command:
+            transcript = command  # LLM hears the command, not the wake word
 
     reply = ask(transcript, history=history or None)
 
@@ -169,8 +191,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             history, sid = _resolve_history(payload)
-            result = talk(payload["audio"], history)
-            if sid and result.get("transcript"):
+            result = talk(
+                payload["audio"],
+                history,
+                hands_free=bool(payload.get("handsFree")),
+                wake_words=payload.get("wakeWords") or None,
+            )
+            if sid and result.get("transcript") and result.get("reply"):
                 import sessions
                 n = sessions.append_turn(sid, result["transcript"], result["reply"])
                 result["turns"] = n // 2

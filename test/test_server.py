@@ -14,6 +14,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
+sys.path.insert(0, ROOT)
 
 
 def free_port():
@@ -36,6 +37,15 @@ def wait_up(port, timeout=60):
 
 
 def main():
+    # wake-word fixtures are gitignored (regenerable) — auto-build if missing
+    need = [os.path.join(ROOT, "test", n) for n in ("wake.wav", "nowake.wav")]
+    if any(not os.path.exists(p) for p in need):
+        print("generating wake-word fixtures via test/gen_wake_fixtures.py …")
+        subprocess.run(
+            [PY, os.path.join(ROOT, "test", "gen_wake_fixtures.py")],
+            check=True, cwd=ROOT,
+        )
+
     port = free_port()
     proc = subprocess.Popen(
         [PY, os.path.join(ROOT, "server.py"), "--port", str(port)],
@@ -95,7 +105,9 @@ def main():
         print("✅ /api/ask + index.html PASS")
 
         # --- server-side session memory ---
-        sid = "test-session-1"
+        # unique sid per run — data/sessions.json persists across runs, so a
+        # hardcoded id would leak turns from previous test runs
+        sid = "test-session-" + os.urandom(4).hex()
         r1 = subprocess.run(
             ["curl", "-s", "-m", "120", "-X", "POST",
              f"http://127.0.0.1:{port}/api/ask",
@@ -140,6 +152,57 @@ def main():
         d3 = json.loads(r3)
         assert d3.get("turns") == 1, f"clear did not wipe history: {r3[:200]}"
         print("✅ /api/clear wipes session memory")
+
+        # --- hands-free wake-word gate ---
+        # unit-level checks first (no server roundtrip)
+        from wakeword import match_wake_word
+        m, rest = match_wake_word("Hey Hermes, what time is it?")
+        assert m and "time" in rest and "hermes" not in rest.lower(), (m, rest)
+        m2, rest2 = match_wake_word("Hermes. turn the lights off")
+        assert m2 and "lights" in rest2, (m2, rest2)
+        m3, rest3 = match_wake_word("what time is it?")
+        assert not m3, (m3, rest3)
+        m4, rest4 = match_wake_word("Hey Hermes")
+        assert m4 and rest4 == "", (m4, rest4)
+        print("✅ match_wake_word unit checks (strip, punctuation, reject, wake-only)")
+
+        def talk_wav(path, **extra):
+            with open(os.path.join(ROOT, "test", path), "rb") as f:
+                b = base64.b64encode(f.read()).decode()
+            t0 = time.time()
+            raw = subprocess.run(
+                ["curl", "-s", "-m", "120", "-X", "POST",
+                 f"http://127.0.0.1:{port}/api/talk",
+                 "-H", "Content-Type: application/json",
+                 "-d", json.dumps({"audio": b, **extra})],
+                capture_output=True, text=True).stdout
+            return json.loads(raw), time.time() - t0
+
+        # hands-free ON + no wake word → gated, fast, silent
+        g, gdt = talk_wav("nowake.wav", handsFree=True)
+        assert g.get("wakeWordHit") is False, f"should be gated: {g}"
+        assert g.get("reply") is None and g.get("audio") is None, "gated call must skip LLM+TTS"
+        assert gdt < 10, f"gated path should be sub-LLM latency, took {gdt:.1f}s"
+        print(f"✅ hands-free gate: no wake word → silent ignore ({gdt:.1f}s, no LLM)")
+
+        # hands-free ON + wake word → full pipeline, wake word stripped
+        w, wdt = talk_wav("wake.wav", handsFree=True)
+        assert w.get("wakeWordHit") is not False and w.get("reply"), f"gated wrongly: {w}"
+        assert "hermes" not in (w.get("transcript") or "").lower(), \
+            f"wake word should be stripped before LLM: {w.get('transcript')!r}"
+        assert "time" in (w.get("transcript") or "").lower(), \
+            f"command should survive stripping: {w.get('transcript')!r}"
+        print(f"✅ hands-free wake word → full reply ({wdt:.1f}s), transcript={w['transcript']!r}")
+
+        # hands-free OFF + no wake word → legacy behavior, full pipeline
+        n, _ = talk_wav("nowake.wav")
+        assert n.get("reply") and n.get("audio"), f"legacy mode broke: {n}"
+        print("✅ hands-free off → legacy always-answer mode intact")
+
+        # custom wake words are honored
+        c, _ = talk_wav("wake.wav", handsFree=True, wakeWords=["computer"])
+        assert c.get("wakeWordHit") is False, f"custom wakeWords ignored: {c}"
+        print("✅ custom wakeWords honored")
         return 0
     finally:
         proc.kill()

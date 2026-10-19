@@ -19,8 +19,7 @@ import time
 from stt import transcribe, record_mic
 from brain import ask
 from tts import synthesize
-
-WAKE_WORDS = ("hey hermes", "hermes", "ok hermes")
+from wakeword import WAKE_WORDS, match_wake_word
 
 
 def speak(text, play=True):
@@ -53,7 +52,7 @@ def run_once(audio_path, text_only=False, verbose=True):
 
 
 def loop():
-    print("Voice loop ready. Speak after the beep. Ctrl+C to quit.")
+    print("Voice loop ready. Say 'hey hermes' to talk. Ctrl+C to quit.")
     history = []
     while True:
         path = record_mic(5)
@@ -61,13 +60,17 @@ def loop():
         os.unlink(path)
         if not heard.strip():
             continue
-        lower = heard.lower()
-        if not any(lower.startswith(w) for w in WAKE_WORDS):
-            # still answer everything in v0 — wake-word filtering comes later
-            pass
-        print(f"🗣️  You: {heard}")
-        history.append({"role": "user", "content": heard})
-        reply = ask(heard, history=history[-6:])
+        matched, command = match_wake_word(heard)
+        if not matched:
+            print(f"  …({heard}) — no wake word, ignored", file=sys.stderr)
+            continue
+        if not command:
+            print("  …wake word only — what's the command?", file=sys.stderr)
+            speak("Yes? I'm listening.")
+            continue
+        print(f"🗣️  You: {command}")
+        history.append({"role": "user", "content": command})
+        reply = ask(command, history=history[-6:])
         history.append({"role": "assistant", "content": reply})
         print(f"🤖 Hermes: {reply}")
         speak(reply)

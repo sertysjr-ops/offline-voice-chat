@@ -59,6 +59,7 @@
   <span class="dot off" id="dot"></span>
   <h1>Hermes Voice</h1>
   <button id="newchat" title="New conversation" style="margin-left:12px;background:var(--panel);border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer;">⟲ new chat</button>
+  <button id="hf" title="Hands-free: continuously listen, answer only after 'hey hermes'" style="background:var(--panel);border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer;">🖐 hands-free: off</button>
   <span class="sub" id="sub">offline · whisper + ollama + piper</span>
 </header>
 <div id="log"></div>
@@ -77,6 +78,19 @@ const micBtn = document.getElementById('mic');
 const textEl = document.getElementById('text');
 const dot = document.getElementById('dot');
 const meterFill = document.getElementById('meterFill');
+const hfBtn = document.getElementById('hf');
+let handsFree = false;
+
+hfBtn.addEventListener('click', () => {
+  handsFree = !handsFree;
+  hfBtn.textContent = `🖐 hands-free: ${handsFree ? 'ON — say "hey hermes"' : 'off'}`;
+  hfBtn.style.color = handsFree ? '#22d3ee' : 'var(--dim)';
+  hfBtn.style.borderColor = handsFree ? '#22d3ee' : 'var(--line)';
+  if (!handsFree && recording) stopRec();
+  setStatus(handsFree
+    ? 'hands-free on — keep the mic open, say "hey hermes, …"'
+    : 'tap the mic or type below');
+});
 // Server-side conversation memory: one session id for this browser tab,
 // survives reloads via sessionStorage. The server keeps the history —
 // the client just renders it.
@@ -225,20 +239,29 @@ function stopRec() {
 
 async function sendAudio(b64) {
   busy = true; micBtn.disabled = true;
+  let ok = false;
   try {
     const r = await fetch('/api/talk', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ audio: b64, session: sessionId }),
+      body: JSON.stringify({ audio: b64, session: sessionId, handsFree }),
     });
     const d = await r.json();
     if (d.error) throw new Error(d.error);
+    if (d.wakeWordHit === false) {
+      // heard something, but not for us — stay quiet, don't bubble
+      ok = true; // not an error; still re-listen
+      setStatus(`heard “${d.transcript}” — say “hey hermes” first`);
+      return;
+    }
     addMsg('you', d.transcript);
     addMsg('hermes', d.reply, d.audio);
-    setStatus('tap the mic or type below');
+    setStatus(handsFree ? 'listening… (hands-free)' : 'tap the mic or type below');
+    ok = true;
   } catch (err) {
     setStatus('⚠ ' + err.message);
   } finally {
     busy = false; micBtn.disabled = false;
+    if (handsFree && ok) setTimeout(() => { if (handsFree && !busy && !recording) startRec(); }, 1200);
   }
 }
 
