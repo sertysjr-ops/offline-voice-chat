@@ -203,6 +203,63 @@ def main():
         c, _ = talk_wav("wake.wav", handsFree=True, wakeWords=["computer"])
         assert c.get("wakeWordHit") is False, f"custom wakeWords ignored: {c}"
         print("✅ custom wakeWords honored")
+
+        # --- streaming TTS: /api/ask + /api/talk with stream:true ---
+        import http.client
+
+        def stream_post(path, payload):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+            conn.request("POST", path, body=json.dumps(payload),
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            ctype = resp.getheader("Content-Type") or ""
+            raw = resp.read().decode()
+            conn.close()
+            return ctype, [json.loads(l) for l in raw.splitlines() if l.strip()]
+
+        ctype, msgs = stream_post("/api/ask", {
+            "text": "Give me three short tips for better sleep.",
+            "session": "test-session-" + os.urandom(4).hex(),
+            "stream": True,
+        })
+        assert "ndjson" in ctype, f"expected ndjson, got {ctype}"
+        types = [m["type"] for m in msgs]
+        assert types[0] == "meta" and msgs[0].get("reply"), f"bad meta: {types}"
+        chunks = [m for m in msgs if m["type"] == "chunk"]
+        assert len(chunks) == msgs[0].get("sentences"), \
+            f"chunk count {len(chunks)} != declared {msgs[0].get('sentences')}"
+        assert len(chunks) >= 2, "multi-sentence reply should yield multiple chunks"
+        for c in chunks:
+            wav = base64.b64decode(c["audio"])
+            assert wav[:4] == b"RIFF", "chunk is not a wav"
+        assert types[-1] == "done" and "turns" in msgs[-1], f"no done line: {types}"
+        print(f"✅ /api/ask stream: meta → {len(chunks)} wav chunks → done")
+
+        # talk streaming carries the transcript in meta
+        with open(os.path.join(ROOT, "test", "test.wav"), "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        ctype, msgs = stream_post("/api/talk", {"audio": b64, "history": [], "stream": True})
+        assert "ndjson" in ctype, f"talk stream expected ndjson, got {ctype}"
+        assert msgs[0]["type"] == "meta" and msgs[0].get("transcript"), \
+            f"talk stream meta missing transcript: {msgs[0]}"
+        assert any(m["type"] == "chunk" for m in msgs), "talk stream had no audio"
+        print(f"✅ /api/talk stream: transcript={msgs[0]['transcript']!r}, "
+              f"{sum(1 for m in msgs if m['type'] == 'chunk')} chunks")
+
+        # gated hands-free request stays plain JSON even with stream:true
+        with open(os.path.join(ROOT, "test", "nowake.wav"), "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        conn.request("POST", "/api/talk", body=json.dumps({
+            "audio": b64, "handsFree": True, "stream": True,
+        }), headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        ctype = resp.getheader("Content-Type") or ""
+        g = json.loads(resp.read().decode())
+        conn.close()
+        assert "json" in ctype and "ndjson" not in ctype, f"gate should be JSON: {ctype}"
+        assert g.get("wakeWordHit") is False, f"gated stream call answered: {g}"
+        print("✅ stream + hands-free gate → plain JSON, still silent")
         return 0
     finally:
         proc.kill()

@@ -112,6 +112,67 @@ async function newChat() {
   setStatus('new conversation — tap the mic or type below');
 }
 
+/* ---------- streaming TTS playback (NDJSON chunks → AudioContext) ---------- */
+let actx = null, nextPlayTime = 0;
+function getCtx() {
+  if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+  if (actx.state === 'suspended') actx.resume();
+  return actx;
+}
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr;
+}
+async function playChunk(b64) {
+  const ctx = getCtx();
+  const bytes = b64ToBytes(b64);
+  const buf = await ctx.decodeAudioData(bytes.buffer.slice(0));
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  const now = ctx.currentTime;
+  if (nextPlayTime < now) nextPlayTime = now + 0.06; // tiny gap before first chunk
+  src.start(nextPlayTime);
+  nextPlayTime += buf.duration;
+}
+
+/**
+ * POST with stream:true. The server either answers plain JSON (wake-word
+ * gate / errors / legacy) or streams NDJSON: meta → chunk* → done.
+ * handlers: {meta, chunk, done} — awaited in arrival order.
+ */
+async function requestMaybeStream(url, payload, handlers) {
+  const r = await fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...payload, stream: true }),
+  });
+  const ctype = r.headers.get('content-type') || '';
+  if (!ctype.includes('ndjson')) {
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    return d; // caller handles JSON (e.g. wakeWordHit gate)
+  }
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 1);
+      if (!line.trim()) continue;
+      const msg = JSON.parse(line);
+      if (msg.type === 'error') throw new Error(msg.message);
+      await handlers[msg.type]?.(msg);
+    }
+  }
+  return null;
+}
+
 /* ---------- chat rendering ---------- */
 function addMsg(who, text, audioB64) {
   const div = document.createElement('div');
@@ -240,21 +301,29 @@ function stopRec() {
 async function sendAudio(b64) {
   busy = true; micBtn.disabled = true;
   let ok = false;
+  nextPlayTime = 0;
   try {
-    const r = await fetch('/api/talk', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ audio: b64, session: sessionId, handsFree }),
-    });
-    const d = await r.json();
-    if (d.error) throw new Error(d.error);
-    if (d.wakeWordHit === false) {
-      // heard something, but not for us — stay quiet, don't bubble
-      ok = true; // not an error; still re-listen
-      setStatus(`heard “${d.transcript}” — say “hey hermes” first`);
-      return;
+    const json = await requestMaybeStream('/api/talk',
+      { audio: b64, session: sessionId, handsFree },
+      {
+        meta: (m) => {
+          addMsg('you', m.transcript);
+          addMsg('hermes', m.reply); // text now; audio streams in per-sentence
+        },
+        chunk: async (m) => {
+          setStatus(`speaking… (${m.i + 1}/${m.n})`);
+          await playChunk(m.audio);
+        },
+      });
+    if (json) {
+      if (json.wakeWordHit === false) {
+        // heard something, but not for us — stay quiet, don't bubble
+        ok = true;
+        setStatus(`heard “${json.transcript}” — say “hey hermes” first`);
+        return;
+      }
+      if (json.reply) addMsg('hermes', json.reply, json.audio);
     }
-    addMsg('you', d.transcript);
-    addMsg('hermes', d.reply, d.audio);
     setStatus(handsFree ? 'listening… (hands-free)' : 'tap the mic or type below');
     ok = true;
   } catch (err) {
@@ -273,15 +342,20 @@ async function sendText() {
   busy = true;
   addMsg('you', t);
   setStatus('thinking…');
+  nextPlayTime = 0;
+  let heardChunk = false;
   try {
-    const r = await fetch('/api/ask', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: t, session: sessionId }),
+    const json = await requestMaybeStream('/api/ask', { text: t, session: sessionId }, {
+      meta: (m) => addMsg('hermes', m.reply),
+      chunk: async (m) => {
+        heardChunk = true;
+        setStatus(`speaking… (${m.i + 1}/${m.n})`);
+        await playChunk(m.audio);
+      },
     });
-    const d = await r.json();
-    if (d.error) throw new Error(d.error);
-    addMsg('hermes', d.reply, d.audio);
-    setStatus('tap the mic or type below');
+    if (json && json.reply) addMsg('hermes', json.reply, json.audio);
+    if (!heardChunk && !json) setStatus('no audio came back — check the server log');
+    else setStatus('tap the mic or type below');
   } catch (err) {
     setStatus('⚠ ' + err.message);
   } finally { busy = false; }

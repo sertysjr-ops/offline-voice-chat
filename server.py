@@ -9,7 +9,12 @@ Serves a single-page browser UI and the voice pipeline API:
                              → {transcript, reply, audio: base64 wav, turns}
                              handsFree on + no wake word →
                              {transcript, wakeWordHit: false, reply: null, audio: null}
+                             add "stream": true → NDJSON: meta line (transcript,
+                             reply, sentence count), one chunk line per spoken
+                             sentence (base64 WAV), done line. The browser plays
+                             chunk 1 while later sentences still synthesize.
     POST /api/ask          → JSON {text, session?} → {reply, audio, turns}
+                             "stream": true → same NDJSON protocol minus transcript.
     POST /api/clear        → JSON {session} → {ok}   (wipe conversation)
 
 Models load lazily on first request (whisper + piper take a few seconds).
@@ -41,6 +46,47 @@ def get_recognizer():
     return _recognizer
 
 
+def transcribe(audio_b64):
+    """wav → text. Shared by the streaming and buffered talk paths."""
+    import tempfile
+    import numpy as np
+
+    wav_bytes = base64.b64decode(audio_b64)
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.write(wav_bytes)
+    tmp.close()
+
+    import wave
+    with wave.open(tmp.name, "rb") as f:
+        assert f.getframerate() == 16000 and f.getnchannels() == 1, "need 16kHz mono wav"
+        samples = np.frombuffer(f.readframes(f.getnframes()), dtype=np.int16)
+
+    with _lock:  # sherpa recognizers are not thread-safe
+        recognizer = get_recognizer()
+        stream = recognizer.create_stream()
+        stream.accept_waveform(16000, samples.astype("float32") / 32768.0)
+        recognizer.decode_stream(stream)
+        return stream.result.text.strip()
+
+
+def apply_wake_gate(transcript, hands_free=False, wake_words=None):
+    """Hands-free gate. Returns (gated_response_or_None, cleaned_transcript)."""
+    from wakeword import WAKE_WORDS, match_wake_word
+
+    if not hands_free:
+        return None, transcript
+    matched, command = match_wake_word(transcript, wake_words or WAKE_WORDS)
+    if not matched:
+        return {
+            "transcript": transcript,
+            "wakeWordHit": False,
+            "reply": None,
+            "audio": None,
+        }, None
+    # LLM hears the command, not the wake word
+    return None, (command or transcript)
+
+
 def synthesize(text, out_path):
     global _tts
     if _tts is None:
@@ -59,42 +105,15 @@ def talk(audio_b64, history, hands_free=False, wake_words=None):
     sees the command.
     """
     import tempfile
-    import numpy as np
     from brain import ask
-    from wakeword import WAKE_WORDS, match_wake_word
 
-    wav_bytes = base64.b64decode(audio_b64)
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp.write(wav_bytes)
-    tmp.close()
-
-    import wave
-    with wave.open(tmp.name, "rb") as f:
-        assert f.getframerate() == 16000 and f.getnchannels() == 1, "need 16kHz mono wav"
-        samples = np.frombuffer(f.readframes(f.getnframes()), dtype=np.int16)
-
-    with _lock:  # sherpa recognizers are not thread-safe
-        recognizer = get_recognizer()
-        stream = recognizer.create_stream()
-        stream.accept_waveform(16000, samples.astype("float32") / 32768.0)
-        t0 = time.time()
-        recognizer.decode_stream(stream)
-        transcript = stream.result.text.strip()
-
+    transcript = transcribe(audio_b64)
     if not transcript:
         return {"transcript": "", "reply": "I didn't catch that — try again.", "audio": None}
 
-    if hands_free:
-        matched, command = match_wake_word(transcript, wake_words or WAKE_WORDS)
-        if not matched:
-            return {
-                "transcript": transcript,
-                "wakeWordHit": False,
-                "reply": None,
-                "audio": None,
-            }
-        if command:
-            transcript = command  # LLM hears the command, not the wake word
+    gated, transcript = apply_wake_gate(transcript, hands_free, wake_words)
+    if gated:
+        return gated
 
     reply = ask(transcript, history=history or None)
 
@@ -132,6 +151,37 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(data)
+
+    # --- NDJSON streaming (HTTP/1.0 close-delimited: no Content-Length, the
+    # client reads until EOF). First line is always "meta", then one "chunk"
+    # per spoken sentence (base64 WAV), then "done". ---
+    def _stream_begin(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.close_connection = True
+
+    def _stream_line(self, obj):
+        self.wfile.write(json.dumps(obj).encode() + b"\n")
+        self.wfile.flush()
+
+    def _stream_speech(self, reply, max_chunks=8):
+        """Synthesize reply sentence-by-sentence, streaming each WAV as ready."""
+        import tts as tts_mod
+        global _tts
+        if _tts is None:
+            _tts = tts_mod.build_tts()
+        sentences = tts_mod.split_sentences(reply)[:max_chunks]
+        for i, sentence in enumerate(sentences):
+            with _lock:
+                pcm, sr = tts_mod.synthesize_pcm(_tts, sentence)
+            self._stream_line({
+                "type": "chunk", "i": i, "n": len(sentences),
+                "audio": base64.b64encode(tts_mod.pcm_to_wav_bytes(pcm, sr)).decode(),
+            })
+        return len(sentences)
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
@@ -171,14 +221,29 @@ class Handler(BaseHTTPRequestHandler):
                 from brain import ask
                 history, sid = _resolve_history(payload)
                 reply = ask(text, history=history)
+                import sessions
+                n = sessions.append_turn(sid, text, reply) if sid else 0
+
+                if payload.get("stream"):
+                    # sentence-chunked TTS: browser starts playing chunk 1
+                    # while later sentences are still synthesizing
+                    import tts as tts_mod
+                    sentences = tts_mod.split_sentences(reply)
+                    self._stream_begin()
+                    self._stream_line({
+                        "type": "meta", "reply": reply,
+                        "sentences": len(sentences), "turns": n // 2,
+                    })
+                    self._stream_speech(reply)
+                    self._stream_line({"type": "done", "turns": n // 2})
+                    return
+
                 out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                 out.close()
                 with _lock:
                     path, _dur = synthesize(reply, out.name)
                 with open(path, "rb") as f:
                     audio_b64 = base64.b64encode(f.read()).decode()
-                import sessions
-                n = sessions.append_turn(sid, text, reply) if sid else 0
                 self._send(200, json.dumps({
                     "reply": reply, "audio": audio_b64, "turns": n // 2,
                 }))
@@ -191,6 +256,44 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             history, sid = _resolve_history(payload)
+
+            if payload.get("stream"):
+                # streaming variant: STT + wake gate happen before the stream
+                # starts; if gated we fall back to a plain JSON response
+                transcript = transcribe(payload["audio"])
+                if not transcript:
+                    self._send(200, json.dumps({
+                        "transcript": "",
+                        "reply": "I didn't catch that — try again.",
+                        "audio": None,
+                    }))
+                    return
+                gated, transcript = apply_wake_gate(
+                    transcript,
+                    bool(payload.get("handsFree")),
+                    payload.get("wakeWords") or None,
+                )
+                if gated:
+                    self._send(200, json.dumps(gated))
+                    return
+                assert transcript is not None  # not gated ⇒ transcript survived
+
+                from brain import ask
+                reply = ask(transcript, history=history or None)
+                import sessions
+                n = sessions.append_turn(sid, transcript, reply) if sid else 0
+
+                import tts as tts_mod
+                sentences = tts_mod.split_sentences(reply)
+                self._stream_begin()
+                self._stream_line({
+                    "type": "meta", "transcript": transcript, "reply": reply,
+                    "sentences": len(sentences), "turns": n // 2,
+                })
+                self._stream_speech(reply)
+                self._stream_line({"type": "done", "turns": n // 2})
+                return
+
             result = talk(
                 payload["audio"],
                 history,

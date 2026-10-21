@@ -8,11 +8,16 @@ Usage:
 """
 import argparse
 import os
+import re
 import subprocess
 
 import sherpa_onnx
 
 VOICE_DIR = os.path.join(os.path.dirname(__file__), "voices", "vits-piper-en_US-lessac-medium")
+
+# piper-lessac handles sentences of ~<200 chars well; longer than that the
+# prosody gets rambling. Keep chunks in the sweet spot.
+MAX_SENTENCE_CHARS = 180
 
 
 def build_tts():
@@ -30,21 +35,65 @@ def build_tts():
     )
 
 
-def synthesize(text, out_path="out.wav", speed=1.0):
-    tts = build_tts()
+def split_sentences(text, max_chars=MAX_SENTENCE_CHARS):
+    """Split prose into TTS-ready sentence chunks.
+
+    Splits on sentence-final punctuation, then greedily merges short
+    sentences (and hard-wraps overlong ones) so every chunk is speakable
+    in one natural breath. Abbreviations like "Mr." are not handled —
+    the voice assistant's replies are short and conversational.
+    """
+    parts = [p.strip() for p in re.split(r"(?<=[.!?;])\s+", text.strip()) if p.strip()]
+    chunks = []
+    for p in parts:
+        # hard-wrap anything still too long at clause boundaries if possible
+        while len(p) > max_chars:
+            cut = p.rfind(", ", 0, max_chars)
+            if cut < max_chars // 2:
+                cut = p.rfind(" ", 0, max_chars)
+            if cut <= 0:
+                cut = max_chars
+            chunks.append(p[:cut].strip().rstrip(","))
+            p = p[cut:].strip().lstrip(",")
+        if not p:
+            continue
+        if chunks and len(chunks[-1]) + len(p) + 1 <= max_chars:
+            chunks[-1] = chunks[-1] + " " + p
+        else:
+            chunks.append(p)
+    return chunks or [text.strip()]
+
+
+def synthesize_pcm(tts, text, speed=1.0):
+    """Generate audio in-memory. Returns (int16 numpy array, sample_rate)."""
     audio = tts.generate(text, sid=0, speed=speed)
     if audio.samples is None or len(audio.samples) == 0:
         raise RuntimeError("TTS produced no audio")
-    # sherpa returns float32 samples at the model sample rate
-    import wave
     import numpy as np
     pcm = (np.array(audio.samples) * 32767).clip(-32768, 32767).astype(np.int16)
-    with wave.open(out_path, "wb") as f:
+    return pcm, audio.sample_rate
+
+
+def pcm_to_wav_bytes(pcm, sample_rate):
+    """Wrap raw int16 mono PCM in a WAV container, return bytes."""
+    import io
+    import wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as f:
         f.setnchannels(1)
         f.setsampwidth(2)
-        f.setframerate(audio.sample_rate)
+        f.setframerate(sample_rate)
         f.writeframes(pcm.tobytes())
-    return out_path, len(audio.samples) / audio.sample_rate
+    return buf.getvalue()
+
+
+def synthesize(text, out_path="out.wav", speed=1.0):
+    tts = build_tts()
+    pcm, sample_rate = synthesize_pcm(tts, text, speed)
+    wav = pcm_to_wav_bytes(pcm, sample_rate)
+    with open(out_path, "wb") as f:
+        f.write(wav)
+    return out_path, len(pcm) / sample_rate
 
 
 def main():
