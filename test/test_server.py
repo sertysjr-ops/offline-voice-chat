@@ -274,6 +274,86 @@ def main():
         assert "json" in ctype and "ndjson" not in ctype, f"gate should be JSON: {ctype}"
         assert g.get("wakeWordHit") is False, f"gated stream call answered: {g}"
         print("✅ stream + hands-free gate → plain JSON, still silent")
+
+        # --- voice prefs: unit-level profile checks (no server needed) ---
+        import sessions
+        assert sessions.clamp_speed(99) == 2.5, "speed clamp high"
+        assert sessions.clamp_speed(0.1) == 0.5, "speed clamp low"
+        assert sessions.clamp_speed("junk") == 1.0, "speed clamp junk"
+        pu = sessions.set_profile("unit-prof", speed=1.6, voice="libritts", speaker=121)
+        assert pu["speed"] == 1.6 and pu["voice"] == "libritts" and pu["speaker"] == 121
+        gu = sessions.get_profile("unit-prof")
+        assert gu["speaker"] == 121 and gu["speed"] == 1.6, f"profile roundtrip: {gu}"
+        gd = sessions.get_profile("never-seen")
+        assert gd == {"speed": 1.0, "voice": "lessac", "speaker": 0}, f"defaults: {gd}"
+        print("✅ profile unit checks (clamp bounds, set/get roundtrip, defaults)")
+
+        # --- /api/voices lists installed models + presets ---
+        rv = subprocess.run(
+            ["curl", "-s", "-m", "10", f"http://127.0.0.1:{port}/api/voices"],
+            capture_output=True, text=True).stdout
+        dv = json.loads(rv)
+        voices = {v["name"]: v for v in dv.get("voices", [])}
+        assert "lessac" in voices, f"lessac missing: {voices}"
+        assert "libritts" in voices, "libritts (multi-speaker) missing"
+        assert voices["libritts"]["multiSpeaker"] is True
+        assert voices["libritts"]["numSpeakers"] == 904
+        assert "nova" in voices["libritts"]["presets"]
+        print("✅ /api/voices: lessac + libritts(904 spk, presets) listed")
+
+        # --- TTS speed: faster speed → shorter wav, same text (unit-level) ---
+        import tts as tts_mod
+        probe = "The quick brown fox jumps over the lazy dog."
+        eng = tts_mod.build_tts("lessac")
+        tmp_slow, d_slow = tts_mod.synthesize_with(probe, os.path.join(ROOT, "test", "_sp_slow.wav"), eng, 0.7, 0)
+        tmp_fast, d_fast = tts_mod.synthesize_with(probe, os.path.join(ROOT, "test", "_sp_fast.wav"), eng, 1.8, 0)
+        os.unlink(tmp_slow); os.unlink(tmp_fast)
+        assert d_fast < d_slow * 0.75, f"speed had no effect: 0.7x={d_slow:.2f}s 1.8x={d_fast:.2f}s"
+        print(f"✅ TTS speed control: 0.7× → {d_slow:.1f}s, 1.8× → {d_fast:.1f}s")
+
+        # --- API-level: preset resolution + per-session profile persistence ---
+        def ask_json(payload):
+            raw = subprocess.run(
+                ["curl", "-s", "-m", "180", "-X", "POST",
+                 f"http://127.0.0.1:{port}/api/ask",
+                 "-H", "Content-Type: application/json",
+                 "-d", json.dumps(payload)],
+                capture_output=True, text=True).stdout
+            return json.loads(raw)
+
+        vsid = "test-voice-" + os.urandom(4).hex()
+        a1 = ask_json({"text": "Reply with exactly: OK.",
+                       "session": vsid, "voice": "libritts:forge", "speed": 1.4})
+        assert a1.get("reply") and a1.get("audio"), f"voice ask failed: {a1}"
+        v1 = a1.get("voice") or {}
+        assert v1.get("voice") == "libritts" and v1.get("speaker") == 121, \
+            f"preset 'forge' should resolve to speaker 121: {v1}"
+        assert v1.get("speed") == 1.4, f"speed echo: {v1}"
+        print(f"✅ preset resolution: libritts:forge → speaker {v1['speaker']}, speed echo {v1['speed']}×")
+
+        # second call, NO voice fields → session profile applies
+        a2 = ask_json({"text": "Reply with exactly: OK again.", "session": vsid})
+        v2 = a2.get("voice") or {}
+        assert v2.get("voice") == "libritts" and v2.get("speaker") == 121 and \
+            v2.get("speed") == 1.4, f"profile should persist across calls: {v2}"
+        wav = base64.b64decode(a2["audio"])
+        assert wav[:4] == b"RIFF", "profiled reply is not a wav"
+        print("✅ per-session voice profile persists (libritts #121 @ 1.4× on 2nd call)")
+
+        # unknown voice name falls back to lessac instead of 500ing
+        a3 = ask_json({"text": "Reply with exactly: OK.", "voice": "nonexistent-model"})
+        v3 = a3.get("voice") or {}
+        assert a3.get("audio") and v3.get("voice") == "lessac", \
+            f"unknown voice should fall back to lessac: {v3}"
+        print("✅ unknown voice name → graceful lessac fallback")
+
+        # index.html carries the voice controls
+        html2 = subprocess.run(
+            ["curl", "-s", "-m", "5", f"http://127.0.0.1:{port}/"],
+            capture_output=True, text=True).stdout
+        for token in ("voiceSel", "voicePayload", "/api/voices", 'id="speed"'):
+            assert token in html2, f"voice UI wiring missing: {token!r}"
+        print("✅ index.html voice controls (selector + speed slider) wired")
         return 0
     finally:
         proc.kill()

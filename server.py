@@ -5,17 +5,25 @@ Serves a single-page browser UI and the voice pipeline API:
 
     GET  /                 → index.html
     POST /api/talk         → JSON {audio: base64 16kHz mono wav, session?: "id",
-                             handsFree?: bool, wakeWords?: string[]}
-                             → {transcript, reply, audio: base64 wav, turns}
+                             handsFree?: bool, wakeWords?: string[],
+                             speed?: 0.5–2.5, voice?: "lessac"|"libritts"|"libritts:preset",
+                             speaker?: int}
+                             → {transcript, reply, audio, turns, voice}
                              handsFree on + no wake word →
                              {transcript, wakeWordHit: false, reply: null, audio: null}
                              add "stream": true → NDJSON: meta line (transcript,
-                             reply, sentence count), one chunk line per spoken
+                             reply, sentence count, voice), one chunk line per spoken
                              sentence (base64 WAV), done line. The browser plays
                              chunk 1 while later sentences still synthesize.
-    POST /api/ask          → JSON {text, session?} → {reply, audio, turns}
+    POST /api/ask          → JSON {text, session?, speed?, voice?, speaker?}
+                             → {reply, audio, turns, voice}
                              "stream": true → same NDJSON protocol minus transcript.
     POST /api/clear        → JSON {session} → {ok}   (wipe conversation)
+    GET  /api/voices       → installed voice models + libritts speaker presets
+
+    Voice prefs: per-request fields win; otherwise the session's saved
+    profile applies (persisted in data/sessions.json alongside history).
+    Speed is clamped to 0.5–2.5; unknown voice names fall back to lessac.
 
 Models load lazily on first request (whisper + piper take a few seconds).
 
@@ -33,9 +41,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-_lock = threading.Lock()
+# RLock: TTS synthesis runs under this lock and itself calls get_tts(),
+# which acquires it again — reentrant so same-thread nesting is safe.
+_lock = threading.RLock()
 _recognizer = None
-_tts = None
+_tts_cache: dict[str, object] = {}
 
 
 def get_recognizer():
@@ -44,6 +54,69 @@ def get_recognizer():
         import stt
         _recognizer = stt.build_recognizer()
     return _recognizer
+
+
+def get_tts(voice="lessac"):
+    """One TTS instance per voice model, built lazily under the lock."""
+    import tts as tts_mod
+    key = voice if voice in tts_mod.list_voices() else "lessac"
+    with _lock:
+        if key not in _tts_cache:
+            _tts_cache[key] = tts_mod.build_tts(key)
+    return key, _tts_cache[key]
+
+
+def resolve_voice(payload, sid=None):
+    """Pick (voice, speaker, speed) for a request.
+
+    Payload fields win; otherwise the session profile applies; otherwise
+    defaults. When a session id is present and the payload carried any
+    voice fields, they are persisted into the profile.
+    """
+    import sessions
+
+    prof = sessions.get_profile(sid) if sid else dict(sessions.DEFAULT_PROFILE)
+    speed = prof["speed"]
+    voice = prof["voice"]
+    speaker = prof["speaker"]
+
+    if payload.get("speed") is not None:
+        speed = sessions.clamp_speed(payload.get("speed"))
+    if isinstance(payload.get("voice"), str) and payload["voice"].strip():
+        voice = payload["voice"].strip()[:32]
+    if payload.get("speaker") is not None:
+        try:
+            speaker = max(0, int(payload["speaker"]))
+        except (TypeError, ValueError):
+            pass
+
+    # multi-speaker preset names → concrete speaker ids ("libritts:nova")
+    if ":" in voice:
+        model, _, tag = voice.partition(":")
+        import tts as tts_mod
+        presets = tts_mod.list_voices().get(model, {}).get("presets", {})
+        if tag in presets:
+            voice, speaker = model, presets[tag]
+
+    # validate against installed models, fall back gracefully
+    import tts as tts_mod
+    voices = tts_mod.list_voices()
+    if voice not in voices:
+        voice = "lessac" if "lessac" in voices else next(iter(voices), "lessac")
+        speaker = 0
+    elif not voices[voice].get("multi_speaker"):
+        speaker = 0
+    else:
+        speaker = min(speaker, voices[voice]["num_speakers"] - 1)
+
+    if sid and (
+        payload.get("speed") is not None
+        or isinstance(payload.get("voice"), str)
+        or payload.get("speaker") is not None
+    ):
+        sessions.set_profile(sid, speed=speed, voice=voice, speaker=speaker)
+
+    return voice, speaker, speed
 
 
 def transcribe(audio_b64):
@@ -87,16 +160,14 @@ def apply_wake_gate(transcript, hands_free=False, wake_words=None):
     return None, (command or transcript)
 
 
-def synthesize(text, out_path):
-    global _tts
-    if _tts is None:
-        import tts as tts_mod
-        _tts = tts_mod.build_tts()
+def synthesize(text, out_path, speed=1.0, voice="lessac", speaker=0):
     import tts as tts_mod
-    return tts_mod.synthesize(text, out_path)
+    key, engine = get_tts(voice)
+    return tts_mod.synthesize_with(text, out_path, engine, speed, speaker)
 
 
-def talk(audio_b64, history, hands_free=False, wake_words=None):
+def talk(audio_b64, history, hands_free=False, wake_words=None,
+         speed=1.0, voice="lessac", speaker=0):
     """Full pipeline: wav → STT → [wake-word gate] → LLM → TTS.
 
     With hands_free on, a transcript without a wake word returns early:
@@ -120,7 +191,7 @@ def talk(audio_b64, history, hands_free=False, wake_words=None):
     out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     out.close()
     with _lock:
-        path, _dur = synthesize(reply, out.name)
+        path, _dur = synthesize(reply, out.name, speed, voice, speaker)
     with open(path, "rb") as f:
         audio_b64_out = base64.b64encode(f.read()).decode()
 
@@ -167,16 +238,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(obj).encode() + b"\n")
         self.wfile.flush()
 
-    def _stream_speech(self, reply, max_chunks=8):
+    def _stream_speech(self, reply, max_chunks=8, speed=1.0, voice="lessac", speaker=0):
         """Synthesize reply sentence-by-sentence, streaming each WAV as ready."""
         import tts as tts_mod
-        global _tts
-        if _tts is None:
-            _tts = tts_mod.build_tts()
+        key, engine = get_tts(voice)
         sentences = tts_mod.split_sentences(reply)[:max_chunks]
         for i, sentence in enumerate(sentences):
             with _lock:
-                pcm, sr = tts_mod.synthesize_pcm(_tts, sentence)
+                pcm, sr = tts_mod.synthesize_pcm(engine, sentence, speed, speaker)
             self._stream_line({
                 "type": "chunk", "i": i, "n": len(sentences),
                 "audio": base64.b64encode(tts_mod.pcm_to_wav_bytes(pcm, sr)).decode(),
@@ -188,7 +257,21 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.path.join(os.path.dirname(__file__), "index.html"), "rb") as f:
                 self._send(200, f.read(), "text/html; charset=utf-8")
         elif self.path == "/api/health":
-            self._send(200, json.dumps({"ok": True, "models": {"stt": _recognizer is not None, "tts": _tts is not None}}))
+            self._send(200, json.dumps({"ok": True, "models": {"stt": _recognizer is not None, "tts": bool(_tts_cache)}}))
+        elif self.path == "/api/voices":
+            import tts as tts_mod
+            voices = tts_mod.list_voices()
+            self._send(200, json.dumps({
+                "voices": [
+                    {
+                        "name": name,
+                        "multiSpeaker": cfg["multi_speaker"],
+                        "numSpeakers": cfg["num_speakers"],
+                        "presets": cfg["presets"],
+                    }
+                    for name, cfg in voices.items()
+                ]
+            }))
         else:
             self._send(404, '{"error": "not found"}')
 
@@ -220,9 +303,11 @@ class Handler(BaseHTTPRequestHandler):
                 import tempfile
                 from brain import ask
                 history, sid = _resolve_history(payload)
+                voice, speaker, speed = resolve_voice(payload, sid)
                 reply = ask(text, history=history)
                 import sessions
                 n = sessions.append_turn(sid, text, reply) if sid else 0
+                voice_info = {"voice": voice, "speaker": speaker, "speed": speed}
 
                 if payload.get("stream"):
                     # sentence-chunked TTS: browser starts playing chunk 1
@@ -233,19 +318,21 @@ class Handler(BaseHTTPRequestHandler):
                     self._stream_line({
                         "type": "meta", "reply": reply,
                         "sentences": len(sentences), "turns": n // 2,
+                        "voice": voice_info,
                     })
-                    self._stream_speech(reply)
-                    self._stream_line({"type": "done", "turns": n // 2})
+                    self._stream_speech(reply, speed=speed, voice=voice, speaker=speaker)
+                    self._stream_line({"type": "done", "turns": n // 2, "voice": voice_info})
                     return
 
                 out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                 out.close()
                 with _lock:
-                    path, _dur = synthesize(reply, out.name)
+                    path, _dur = synthesize(reply, out.name, speed, voice, speaker)
                 with open(path, "rb") as f:
                     audio_b64 = base64.b64encode(f.read()).decode()
                 self._send(200, json.dumps({
                     "reply": reply, "audio": audio_b64, "turns": n // 2,
+                    "voice": voice_info,
                 }))
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}))
@@ -256,6 +343,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             history, sid = _resolve_history(payload)
+            voice, speaker, speed = resolve_voice(payload, sid)
+            voice_info = {"voice": voice, "speaker": speaker, "speed": speed}
 
             if payload.get("stream"):
                 # streaming variant: STT + wake gate happen before the stream
@@ -289,9 +378,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._stream_line({
                     "type": "meta", "transcript": transcript, "reply": reply,
                     "sentences": len(sentences), "turns": n // 2,
+                    "voice": voice_info,
                 })
-                self._stream_speech(reply)
-                self._stream_line({"type": "done", "turns": n // 2})
+                self._stream_speech(reply, speed=speed, voice=voice, speaker=speaker)
+                self._stream_line({"type": "done", "turns": n // 2, "voice": voice_info})
                 return
 
             result = talk(
@@ -299,7 +389,9 @@ class Handler(BaseHTTPRequestHandler):
                 history,
                 hands_free=bool(payload.get("handsFree")),
                 wake_words=payload.get("wakeWords") or None,
+                speed=speed, voice=voice, speaker=speaker,
             )
+            result["voice"] = voice_info
             if sid and result.get("transcript") and result.get("reply"):
                 import sessions
                 n = sessions.append_turn(sid, result["transcript"], result["reply"])

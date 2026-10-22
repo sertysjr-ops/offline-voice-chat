@@ -11,6 +11,10 @@ Usage:
     hist = get_history(sid)               # [] if new
     append_turn(sid, user_text, reply)    # adds both messages, persists
     clear(sid)                            # wipe one session
+
+    # voice profiles — per-session TTS prefs, persisted with sessions
+    p = get_profile(sid)                  # {"speed": 1.0, "voice": "lessac", "speaker": 0}
+    set_profile(sid, speed=1.2, voice="libritts", speaker=121)
 """
 import json
 import os
@@ -25,26 +29,33 @@ MAX_SESSIONS = 50  # LRU-ish: drop oldest when exceeded
 
 _lock = threading.Lock()
 _sessions: dict[str, list[dict]] = {}
+_profiles: dict[str, dict] = {}
+
+DEFAULT_PROFILE = {"speed": 1.0, "voice": "lessac", "speaker": 0}
+SPEED_MIN, SPEED_MAX = 0.5, 2.5
 
 
 def _load() -> None:
-    global _sessions
+    global _sessions, _profiles
     if not os.path.exists(DATA_FILE):
         return
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        # back-compat: either {sid: [...]} or {"sessions": {...}}
-        _sessions = raw.get("sessions", raw) if isinstance(raw, dict) else {}
+        if isinstance(raw, dict):
+            # back-compat: bare {sid: [...]}, or wrapped {"sessions": {...}}
+            _sessions = raw.get("sessions", raw if "profiles" not in raw else {})
+            _profiles = raw.get("profiles", {}) if isinstance(raw.get("profiles"), dict) else {}
     except Exception:
         _sessions = {}
+        _profiles = {}
 
 
 def _save() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     tmp = DATA_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"sessions": _sessions}, f)
+        json.dump({"sessions": _sessions, "profiles": _profiles}, f)
     os.replace(tmp, DATA_FILE)
 
 
@@ -101,3 +112,48 @@ def clear(sid: str) -> bool:
 def turns(sid: str) -> int:
     with _lock:
         return len(_sessions.get(sid) or []) // 2
+
+
+def clamp_speed(v) -> float:
+    """Coerce anything into a sane speed value."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(SPEED_MIN, min(SPEED_MAX, f))
+
+
+def get_profile(sid: str) -> dict:
+    """Session voice prefs merged over defaults. Unknown sid → defaults."""
+    if not sid:
+        return dict(DEFAULT_PROFILE)
+    with _lock:
+        stored = _profiles.get(sid) or {}
+    p = dict(DEFAULT_PROFILE)
+    p.update({k: stored[k] for k in DEFAULT_PROFILE if k in stored})
+    p["speed"] = clamp_speed(p["speed"])
+    try:
+        p["speaker"] = max(0, int(p["speaker"]))
+    except (TypeError, ValueError):
+        p["speaker"] = 0
+    return p
+
+
+def set_profile(sid: str, speed=None, voice=None, speaker=None) -> dict:
+    """Merge provided fields into the session's profile; returns the result."""
+    if not sid:
+        return dict(DEFAULT_PROFILE)
+    with _lock:
+        p = dict(_profiles.get(sid) or DEFAULT_PROFILE)
+        if speed is not None:
+            p["speed"] = clamp_speed(speed)
+        if voice is not None and isinstance(voice, str) and voice.strip():
+            p["voice"] = voice.strip()[:32]
+        if speaker is not None:
+            try:
+                p["speaker"] = max(0, int(speaker))
+            except (TypeError, ValueError):
+                pass
+        _profiles[sid] = p
+        _save()
+        return dict(p)

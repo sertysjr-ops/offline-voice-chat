@@ -60,6 +60,11 @@
   <h1>Hermes Voice</h1>
   <button id="newchat" title="New conversation" style="margin-left:12px;background:var(--panel);border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer;">⟲ new chat</button>
   <button id="hf" title="Hands-free: continuously listen, answer only after 'hey hermes'" style="background:var(--panel);border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer;">🖐 hands-free: off</button>
+  <label style="margin-left:10px;display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12px;">
+    🎚 <input type="range" id="speed" min="0.5" max="2.5" step="0.1" value="1" style="width:80px;accent-color:var(--acc2);">
+    <span id="speedVal">1.0×</span>
+  </label>
+  <select id="voiceSel" title="Voice" style="margin-left:6px;background:var(--panel);border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:4px 8px;font-size:12px;"></select>
   <span class="sub" id="sub">offline · whisper + ollama + piper</span>
 </header>
 <div id="log"></div>
@@ -79,7 +84,46 @@ const textEl = document.getElementById('text');
 const dot = document.getElementById('dot');
 const meterFill = document.getElementById('meterFill');
 const hfBtn = document.getElementById('hf');
+const speedEl = document.getElementById('speed');
+const speedVal = document.getElementById('speedVal');
+const voiceSel = document.getElementById('voiceSel');
 let handsFree = false;
+
+/* Voice prefs ride along with every request; the server saves them into
+ * the session profile, so a reload keeps the last pick. */
+function voicePayload() {
+  return { speed: parseFloat(speedEl.value), voice: voiceSel.value || 'lessac' };
+}
+function showVoice(v) {
+  if (!v) return;
+  speedVal.textContent = Number(v.speed).toFixed(1) + '×';
+  if (document.activeElement !== speedEl) speedEl.value = v.speed;
+  if (voiceSel.querySelector(`option[value="${v.voice}"]`)) voiceSel.value = v.voice;
+  const label = v.voice + (v.voice === 'libritts' ? ` #${v.speaker}` : '');
+  document.getElementById('sub').textContent =
+    `offline · whisper + ollama + piper · ${label} · ${Number(v.speed).toFixed(1)}×`;
+}
+speedEl.addEventListener('input', () => { speedVal.textContent = Number(speedEl.value).toFixed(1) + '×'; });
+
+async function loadVoices() {
+  try {
+    const r = await fetch('/api/voices');
+    const d = await r.json();
+    voiceSel.innerHTML = '';
+    for (const v of d.voices ?? []) {
+      const o = document.createElement('option');
+      o.value = v.name; o.textContent = v.name;
+      voiceSel.appendChild(o);
+      for (const [preset, sid] of Object.entries(v.presets ?? {})) {
+        const p = document.createElement('option');
+        p.value = `${v.name}:${preset}`;
+        p.textContent = `${v.name} · ${preset}`;
+        voiceSel.appendChild(p);
+      }
+    }
+  } catch {}
+}
+loadVoices();
 
 hfBtn.addEventListener('click', () => {
   handsFree = !handsFree;
@@ -329,11 +373,12 @@ async function sendAudio(b64) {
   nextPlayTime = 0;
   try {
     const json = await requestMaybeStream('/api/talk',
-      { audio: b64, session: sessionId, handsFree },
+      { audio: b64, session: sessionId, handsFree, ...voicePayload() },
       {
         meta: (m) => {
           addMsg('you', m.transcript);
           addMsg('hermes', m.reply); // text now; audio streams in per-sentence
+          showVoice(m.voice);
         },
         chunk: async (m) => {
           setStatus(`speaking… (${m.i + 1}/${m.n})`);
@@ -348,6 +393,7 @@ async function sendAudio(b64) {
         return;
       }
       if (json.reply) addMsg('hermes', json.reply, json.audio);
+      showVoice(json.voice);
     }
     setStatus(handsFree ? 'listening… (hands-free)' : 'hold SPACE to talk, or type below');
     ok = true;
@@ -370,15 +416,15 @@ async function sendText() {
   nextPlayTime = 0;
   let heardChunk = false;
   try {
-    const json = await requestMaybeStream('/api/ask', { text: t, session: sessionId }, {
-      meta: (m) => addMsg('hermes', m.reply),
+    const json = await requestMaybeStream('/api/ask', { text: t, session: sessionId, ...voicePayload() }, {
+      meta: (m) => { addMsg('hermes', m.reply); showVoice(m.voice); },
       chunk: async (m) => {
         heardChunk = true;
         setStatus(`speaking… (${m.i + 1}/${m.n})`);
         await playChunk(m.audio);
       },
     });
-    if (json && json.reply) addMsg('hermes', json.reply, json.audio);
+    if (json && json.reply) { addMsg('hermes', json.reply, json.audio); showVoice(json.voice); }
     if (!heardChunk && !json) setStatus('no audio came back — check the server log');
     else setStatus('hold SPACE to talk, or type below');
   } catch (err) {

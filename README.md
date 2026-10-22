@@ -11,7 +11,12 @@ mic → Whisper STT (sherpa-onnx) → Ollama LLM (qwen3.5) → Piper TTS (sherpa
 ```bash
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python sherpa-onnx sounddevice numpy
-# models (already downloaded, see models/ and voices/)
+# models (already downloaded, see models/ and voices/):
+#   whisper tiny.en  → models/sherpa-onnx-whisper-tiny.en/
+#   piper lessac     → voices/vits-piper-en_US-lessac-medium/
+#   piper libritts   → voices/vits-piper-en_US-libritts_r-medium/  (904 speakers)
+curl -sL -o /tmp/libritts.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-libritts_r-medium.tar.bz2 \
+  && tar -xjf /tmp/libritts.tar.bz2 -C voices/ && rm /tmp/libritts.tar.bz2
 ```
 
 Requires [Ollama](https://ollama.com) running with `qwen3.5:4b` pulled (`ollama pull qwen3.5:4b`).
@@ -35,9 +40,14 @@ Requires [Ollama](https://ollama.com) running with `qwen3.5:4b` pulled (`ollama 
 `server.py` (stdlib `http.server`, zero extra deps) serves:
 
 - `GET  /`            → single-page chat UI (`index.html`) with push-to-talk
-- `POST /api/talk`    → `{audio: base64 16kHz-mono wav, history}` → `{transcript, reply, audio}`
-- `POST /api/ask`     → `{text, history}` → `{reply, audio}` (text-only path, skips STT)
+- `POST /api/talk`    → `{audio, session?, handsFree?, speed?, voice?, speaker?}` → `{transcript, reply, audio, voice}`
+- `POST /api/ask`     → `{text, session?, speed?, voice?, speaker?}` → `{reply, audio, voice}` (text-only path, skips STT)
+- `GET  /api/voices`  → installed voice models + named speaker presets (`libritts:nova`, `:forge`, `:pixel`, `:onyx`, `:wisp`)
 - `GET  /api/health`  → `{ok, models}`
+
+Voice prefs: per-request `speed` (0.5–2.5×) and `voice`/`speaker` win; otherwise the
+session's saved profile applies (persisted server-side in `data/sessions.json`).
+Unknown voice names fall back to `lessac` rather than erroring.
 
 The UI records via Web Audio API, resamples to 16kHz mono, encodes WAV in JS,
 and auto-stops on silence (browser-side VAD: RMS < threshold for ~1.4s, 15s max).
