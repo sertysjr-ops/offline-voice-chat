@@ -64,9 +64,9 @@
 </header>
 <div id="log"></div>
 <div id="meter"><i id="meterFill"></i></div>
-<div class="status" id="status">tap the mic or type below</div>
+<div class="status" id="status">hold SPACE to talk, tap the mic, or type below</div>
 <div id="bar">
-  <button id="mic" title="Talk">🎙</button>
+  <button id="mic" title="Talk (or hold SPACE)">🎙</button>
   <input id="text" placeholder="…or type and hit enter" autocomplete="off">
   <button id="send">Send</button>
 </div>
@@ -89,7 +89,7 @@ hfBtn.addEventListener('click', () => {
   if (!handsFree && recording) stopRec();
   setStatus(handsFree
     ? 'hands-free on — keep the mic open, say "hey hermes, …"'
-    : 'tap the mic or type below');
+    : 'hands-free off — hold SPACE to talk, or type below');
 });
 // Server-side conversation memory: one session id for this browser tab,
 // survives reloads via sessionStorage. The server keeps the history —
@@ -109,7 +109,7 @@ async function newChat() {
     });
   } catch {}
   log.innerHTML = '';
-  setStatus('new conversation — tap the mic or type below');
+  setStatus('new conversation — hold SPACE to talk, or type below');
 }
 
 /* ---------- streaming TTS playback (NDJSON chunks → AudioContext) ---------- */
@@ -236,9 +236,33 @@ function b64encode(bytes) {
 let ctx, stream, node, recording = false;
 let recChunks = [];          // Float32 chunks at the AudioContext sample rate
 let silentSince = null, recStart = 0;
+let pttActive = false;       // push-to-talk: hold SPACE, release to send
 const MAX_MS = 15000, SILENCE_MS = 1400, THRESH = 0.015;
 
 micBtn.addEventListener('click', () => { recording ? stopRec() : startRec(); });
+
+/* Push-to-talk: hold SPACE to record, release to send. While held, the
+ * silence auto-stop is disabled — you decide when the utterance ends.
+ * Ignored while hands-free is driving the mic (it has its own loop). */
+window.addEventListener('keydown', (e) => {
+  if (e.code !== 'Space' || e.repeat) return;
+  if (e.target === textEl) return;            // never steal typing space
+  e.preventDefault();                          // no page scroll / button re-click
+  if (pttActive || busy || recording || handsFree) return;
+  pttActive = true;
+  startRec();
+});
+window.addEventListener('keyup', (e) => {
+  if (e.code !== 'Space' || !pttActive) return;
+  pttActive = false;
+  if (recording) stopRec();
+});
+// If the window loses focus mid-hold (alt-tab etc.), release the PTT key.
+window.addEventListener('blur', () => {
+  if (!pttActive) return;
+  pttActive = false;
+  if (recording) stopRec();
+});
 
 async function startRec() {
   if (busy) return;
@@ -259,7 +283,8 @@ async function startRec() {
     meterFill.style.width = Math.min(100, rms * 400) + '%';
     const now = performance.now();
     if (now - recStart > MAX_MS) { stopRec(); return; }
-    if (rms < THRESH) {
+    // In PTT mode the user ends the utterance with the key — no silence stop.
+    if (!pttActive && rms < THRESH) {
       if (silentSince === null) silentSince = now;
       else if (now - silentSince > SILENCE_MS && now - recStart > 800) stopRec();
     } else silentSince = null;
@@ -267,7 +292,7 @@ async function startRec() {
   src.connect(node); node.connect(ctx.destination);
   recording = true;
   micBtn.classList.add('rec');
-  setStatus('listening… (auto-stops on silence)');
+  setStatus(pttActive ? 'recording… release SPACE to send' : 'listening… (auto-stops on silence)');
 }
 
 function stopRec() {
@@ -324,7 +349,7 @@ async function sendAudio(b64) {
       }
       if (json.reply) addMsg('hermes', json.reply, json.audio);
     }
-    setStatus(handsFree ? 'listening… (hands-free)' : 'tap the mic or type below');
+    setStatus(handsFree ? 'listening… (hands-free)' : 'hold SPACE to talk, or type below');
     ok = true;
   } catch (err) {
     setStatus('⚠ ' + err.message);
@@ -355,7 +380,7 @@ async function sendText() {
     });
     if (json && json.reply) addMsg('hermes', json.reply, json.audio);
     if (!heardChunk && !json) setStatus('no audio came back — check the server log');
-    else setStatus('tap the mic or type below');
+    else setStatus('hold SPACE to talk, or type below');
   } catch (err) {
     setStatus('⚠ ' + err.message);
   } finally { busy = false; }

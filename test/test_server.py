@@ -97,12 +97,16 @@ def main():
         d2 = json.loads(raw)
         print(f"/api/ask reply: {(d2.get('reply') or '')[:120]!r}")
         assert d2.get("reply") and d2.get("audio"), "ask endpoint broken"
-        # index.html served
+        # index.html served + push-to-talk wiring present (client-side feature,
+        # so we assert the key handlers exist in the served page)
         html = subprocess.run(
             ["curl", "-s", "-m", "5", f"http://127.0.0.1:{port}/"],
             capture_output=True, text=True).stdout
         assert "<title>Hermes Voice" in html, "index.html not served"
-        print("✅ /api/ask + index.html PASS")
+        for token in ("pttActive", "e.code !== 'Space'", "window.addEventListener('keyup'",
+                      "release SPACE to send", "window.addEventListener('blur'"):
+            assert token in html, f"PTT wiring missing: {token!r}"
+        print("✅ /api/ask + index.html + push-to-talk wiring PASS")
 
         # --- server-side session memory ---
         # unique sid per run — data/sessions.json persists across runs, so a
@@ -228,6 +232,16 @@ def main():
         chunks = [m for m in msgs if m["type"] == "chunk"]
         assert len(chunks) == msgs[0].get("sentences"), \
             f"chunk count {len(chunks)} != declared {msgs[0].get('sentences')}"
+        if len(chunks) < 2:
+            # small models sometimes answer in one sentence — force the issue
+            # once; the structural invariant above already held either way.
+            ctype, msgs = stream_post("/api/ask", {
+                "text": "List three colors. Use exactly three separate sentences, "
+                        "one per color, each ending with a period.",
+                "session": "test-session-" + os.urandom(4).hex(),
+                "stream": True,
+            })
+            chunks = [m for m in msgs if m["type"] == "chunk"]
         assert len(chunks) >= 2, "multi-sentence reply should yield multiple chunks"
         for c in chunks:
             wav = base64.b64decode(c["audio"])
