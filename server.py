@@ -13,8 +13,9 @@ Serves a single-page browser UI and the voice pipeline API:
                              {transcript, wakeWordHit: false, reply: null, audio: null}
                              add "stream": true → NDJSON: meta line (transcript,
                              reply, sentence count, voice), one chunk line per spoken
-                             sentence (base64 WAV), done line. The browser plays
-                             chunk 1 while later sentences still synthesize.
+                             sentence (base64 WAV), done line. Pre-warmed: the LLM
+                             streams tokens and each sentence is synthesized the
+                             moment it completes, so TTS overlaps generation.
     POST /api/ask          → JSON {text, session?, speed?, voice?, speaker?}
                              → {reply, audio, turns, voice}
                              "stream": true → same NDJSON protocol minus transcript.
@@ -34,6 +35,8 @@ import argparse
 import base64
 import json
 import os
+import queue
+import re
 import sys
 import threading
 import time
@@ -238,19 +241,73 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(obj).encode() + b"\n")
         self.wfile.flush()
 
-    def _stream_speech(self, reply, max_chunks=8, speed=1.0, voice="lessac", speaker=0):
-        """Synthesize reply sentence-by-sentence, streaming each WAV as ready."""
+    # Matches a sentence boundary: terminal punctuation followed by whitespace.
+    _SENT_BOUNDARY = re.compile(r"(?<=[.!?;])\s")
+
+    def _pipelined_llm_tts(self, text, history, speed=1.0, voice="lessac",
+                           speaker=0, max_chunks=8):
+        """Pre-warmed pipeline: stream LLM tokens, TTS each sentence the
+        moment it completes — sentence 1 synthesizes while the model is
+        still generating sentence 2+. Returns (full_reply, [wav_b64, ...]).
+
+        Replaces the old serial flow (full reply → then synthesize) which
+        paid LLM time + TTS time; here they overlap.
+        """
         import tts as tts_mod
-        key, engine = get_tts(voice)
-        sentences = tts_mod.split_sentences(reply)[:max_chunks]
-        for i, sentence in enumerate(sentences):
-            with _lock:
-                pcm, sr = tts_mod.synthesize_pcm(engine, sentence, speed, speaker)
-            self._stream_line({
-                "type": "chunk", "i": i, "n": len(sentences),
-                "audio": base64.b64encode(tts_mod.pcm_to_wav_bytes(pcm, sr)).decode(),
-            })
-        return len(sentences)
+        from brain import ask_stream
+
+        _key, engine = get_tts(voice)
+        ready: "queue.Queue" = queue.Queue()
+        wavs: dict[int, str] = {}
+        errors: list[BaseException] = []
+
+        def synth_worker():
+            while True:
+                item = ready.get()
+                if item is None:
+                    return
+                i, sentence = item
+                try:
+                    with _lock:
+                        pcm, sr = tts_mod.synthesize_pcm(engine, sentence, speed, speaker)
+                    wavs[i] = base64.b64encode(
+                        tts_mod.pcm_to_wav_bytes(pcm, sr)).decode()
+                except BaseException as e:  # surface after join
+                    errors.append(e)
+
+        worker = threading.Thread(target=synth_worker, daemon=True)
+        worker.start()
+
+        parts: list[str] = []
+        pending = ""
+        n_sent = 0
+        for tok in ask_stream(text, history=history):
+            parts.append(tok)
+            pending += tok
+            while n_sent < max_chunks:
+                m = self._SENT_BOUNDARY.search(pending)
+                if not m:
+                    break
+                sentence = pending[:m.start()].strip()
+                pending = pending[m.end():]
+                if sentence:
+                    ready.put((n_sent, sentence))
+                    n_sent += 1
+        tail = pending.strip()
+        if tail and n_sent < max_chunks:
+            ready.put((n_sent, tail))
+            n_sent += 1
+        ready.put(None)
+        worker.join()
+        if errors:
+            raise errors[0]
+        reply = "".join(parts).strip()
+        return reply, [wavs[i] for i in range(n_sent)]
+
+    def _stream_wavs(self, wavs):
+        """Emit one NDJSON chunk line per pre-synthesized WAV."""
+        for i, audio in enumerate(wavs):
+            self._stream_line({"type": "chunk", "i": i, "n": len(wavs), "audio": audio})
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
@@ -300,29 +357,32 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, '{"error": "text required"}')
                 return
             try:
-                import tempfile
-                from brain import ask
                 history, sid = _resolve_history(payload)
                 voice, speaker, speed = resolve_voice(payload, sid)
-                reply = ask(text, history=history)
-                import sessions
-                n = sessions.append_turn(sid, text, reply) if sid else 0
                 voice_info = {"voice": voice, "speaker": speaker, "speed": speed}
 
                 if payload.get("stream"):
-                    # sentence-chunked TTS: browser starts playing chunk 1
-                    # while later sentences are still synthesizing
-                    import tts as tts_mod
-                    sentences = tts_mod.split_sentences(reply)
+                    # pre-warmed: LLM streams, TTS synthesizes each sentence
+                    # as it completes — no serial LLM-then-TTS wait
+                    reply, wavs = self._pipelined_llm_tts(
+                        text, history, speed=speed, voice=voice, speaker=speaker)
+                    import sessions
+                    n = sessions.append_turn(sid, text, reply) if sid else 0
                     self._stream_begin()
                     self._stream_line({
                         "type": "meta", "reply": reply,
-                        "sentences": len(sentences), "turns": n // 2,
+                        "sentences": len(wavs), "turns": n // 2,
                         "voice": voice_info,
                     })
-                    self._stream_speech(reply, speed=speed, voice=voice, speaker=speaker)
+                    self._stream_wavs(wavs)
                     self._stream_line({"type": "done", "turns": n // 2, "voice": voice_info})
                     return
+
+                import tempfile
+                from brain import ask
+                reply = ask(text, history=history)
+                import sessions
+                n = sessions.append_turn(sid, text, reply) if sid else 0
 
                 out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                 out.close()
@@ -367,20 +427,19 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 assert transcript is not None  # not gated ⇒ transcript survived
 
-                from brain import ask
-                reply = ask(transcript, history=history or None)
+                reply, wavs = self._pipelined_llm_tts(
+                    transcript, history or None,
+                    speed=speed, voice=voice, speaker=speaker)
                 import sessions
                 n = sessions.append_turn(sid, transcript, reply) if sid else 0
 
-                import tts as tts_mod
-                sentences = tts_mod.split_sentences(reply)
                 self._stream_begin()
                 self._stream_line({
                     "type": "meta", "transcript": transcript, "reply": reply,
-                    "sentences": len(sentences), "turns": n // 2,
+                    "sentences": len(wavs), "turns": n // 2,
                     "voice": voice_info,
                 })
-                self._stream_speech(reply, speed=speed, voice=voice, speaker=speaker)
+                self._stream_wavs(wavs)
                 self._stream_line({"type": "done", "turns": n // 2, "voice": voice_info})
                 return
 

@@ -249,6 +249,24 @@ def main():
         assert types[-1] == "done" and "turns" in msgs[-1], f"no done line: {types}"
         print(f"✅ /api/ask stream: meta → {len(chunks)} wav chunks → done")
 
+        # --- pre-warm: LLM tokens must arrive incrementally (that overlap
+        # is what lets TTS start on sentence 1 mid-generation) ---
+        from brain import ask_stream
+        t0 = time.time()
+        first_tok_at = None
+        toks = []
+        for c in ask_stream("Count from one to five, one number per sentence."):
+            if first_tok_at is None:
+                first_tok_at = time.time()
+            toks.append(c)
+        total = time.time() - t0
+        assert toks and "".join(toks).strip(), "ask_stream yielded nothing"
+        assert first_tok_at is not None
+        assert len(toks) > 1 and first_tok_at - t0 < total * 0.9, \
+            f"no incremental yield: first token {first_tok_at-t0:.1f}s of {total:.1f}s ({len(toks)} toks)"
+        print(f"✅ ask_stream pre-warm: first token {first_tok_at-t0:.1f}s, "
+              f"total {total:.1f}s, {len(toks)} token chunks")
+
         # talk streaming carries the transcript in meta
         with open(os.path.join(ROOT, "test", "test.wav"), "rb") as f:
             b64 = base64.b64encode(f.read()).decode()

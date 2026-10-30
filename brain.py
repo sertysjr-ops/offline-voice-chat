@@ -19,18 +19,21 @@ SYSTEM_PROMPT = (
 )
 
 
-def ask(user_text, history=None):
+def _messages(user_text, history):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
         messages.extend(history)
     messages.append({"role": "user", "content": user_text})
+    return messages
 
+
+def ask(user_text, history=None):
     req = urllib.request.Request(
         f"{OLLAMA_URL}/api/chat",
         data=json.dumps({
             "model": MODEL,
             "think": False,
-            "messages": messages,
+            "messages": _messages(user_text, history),
             "stream": False,
             "options": {"temperature": 0.6, "num_predict": 220},
         }).encode(),
@@ -39,6 +42,37 @@ def ask(user_text, history=None):
     with urllib.request.urlopen(req, timeout=120) as res:
         data = json.loads(res.read())
     return data["message"]["content"].strip()
+
+
+def ask_stream(user_text, history=None):
+    """Yield reply text chunks as the model generates them.
+
+    Same request as ask() but with stream:true — Ollama answers NDJSON,
+    one object per token group. Used by the server to start TTS on the
+    first complete sentence while the rest of the reply still generates.
+    """
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=json.dumps({
+            "model": MODEL,
+            "think": False,
+            "messages": _messages(user_text, history),
+            "stream": True,
+            "options": {"temperature": 0.6, "num_predict": 220},
+        }).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as res:
+        for line in res:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            chunk = (data.get("message") or {}).get("content") or ""
+            if chunk:
+                yield chunk
+            if data.get("done"):
+                break
 
 
 def main():
