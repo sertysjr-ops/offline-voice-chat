@@ -11,11 +11,13 @@ Serves a single-page browser UI and the voice pipeline API:
                              → {transcript, reply, audio, turns, voice}
                              handsFree on + no wake word →
                              {transcript, wakeWordHit: false, reply: null, audio: null}
-                             add "stream": true → NDJSON: meta line (transcript,
-                             reply, sentence count, voice), one chunk line per spoken
-                             sentence (base64 WAV), done line. Pre-warmed: the LLM
-                             streams tokens and each sentence is synthesized the
-                             moment it completes, so TTS overlaps generation.
+                             add "stream": true → NDJSON v2 (true streaming):
+                             meta line (transcript, voice — no reply yet),
+                             one chunk line per spoken sentence (base64 WAV +
+                             sentence text) sent THE MOMENT its TTS finishes —
+                             while the LLM is still generating later sentences —
+                             then a done line with the full reply + sentence
+                             count. Playback starts mid-generation.
     POST /api/ask          → JSON {text, session?, speed?, voice?, speaker?}
                              → {reply, audio, turns, voice}
                              "stream": true → same NDJSON protocol minus transcript.
@@ -226,9 +228,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    # --- NDJSON streaming (HTTP/1.0 close-delimited: no Content-Length, the
-    # client reads until EOF). First line is always "meta", then one "chunk"
-    # per spoken sentence (base64 WAV), then "done". ---
+    # --- NDJSON v2 streaming (HTTP/1.0 close-delimited: no Content-Length,
+    # the client reads until EOF). Line order:
+    #   meta  {type, transcript?, voice}                — sent immediately,
+    #                                                     reply not known yet
+    #   chunk {type, i, text, audio}                    — per spoken sentence,
+    #                                                     sent the moment its
+    #                                                     TTS finishes
+    #   done  {type, reply, sentences, turns, voice}    — full reply lands here
+    #   error {type, message}                           — mid-stream failure
+    # ---
     def _stream_begin(self):
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -244,22 +253,24 @@ class Handler(BaseHTTPRequestHandler):
     # Matches a sentence boundary: terminal punctuation followed by whitespace.
     _SENT_BOUNDARY = re.compile(r"(?<=[.!?;])\s")
 
-    def _pipelined_llm_tts(self, text, history, speed=1.0, voice="lessac",
-                           speaker=0, max_chunks=8):
-        """Pre-warmed pipeline: stream LLM tokens, TTS each sentence the
-        moment it completes — sentence 1 synthesizes while the model is
-        still generating sentence 2+. Returns (full_reply, [wav_b64, ...]).
+    def _stream_pipeline(self, text, history, speed=1.0, voice="lessac",
+                         speaker=0, max_chunks=8):
+        """True-streaming LLM→TTS: consumes the token stream, hands each
+        completed sentence to a TTS worker, and writes its chunk line to the
+        wire IMMEDIATELY — chunk 1 typically hits the client while the model
+        is still generating sentence 2+.
 
-        Replaces the old serial flow (full reply → then synthesize) which
-        paid LLM time + TTS time; here they overlap.
+        Callers must have sent meta already. Returns (full_reply, n_sent).
+        Mid-stream TTS failures raise; the caller turns them into an
+        NDJSON error line (the 200 header is already on the wire, so an
+        HTTP 500 is no longer possible).
         """
         import tts as tts_mod
         from brain import ask_stream
 
         _key, engine = get_tts(voice)
-        ready: "queue.Queue" = queue.Queue()
-        wavs: dict[int, str] = {}
-        errors: list[BaseException] = []
+        ready: "queue.Queue" = queue.Queue()   # (i, sentence) → worker
+        out: "queue.Queue" = queue.Queue()     # (i, sentence, wav) | error ← worker
 
         def synth_worker():
             while True:
@@ -270,13 +281,45 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     with _lock:
                         pcm, sr = tts_mod.synthesize_pcm(engine, sentence, speed, speaker)
-                    wavs[i] = base64.b64encode(
-                        tts_mod.pcm_to_wav_bytes(pcm, sr)).decode()
-                except BaseException as e:  # surface after join
-                    errors.append(e)
+                    out.put((i, sentence, base64.b64encode(
+                        tts_mod.pcm_to_wav_bytes(pcm, sr)).decode()))
+                except BaseException as e:
+                    out.put(e)
 
         worker = threading.Thread(target=synth_worker, daemon=True)
         worker.start()
+
+        emitted = 0
+
+        def drain(block=False):
+            """Write whatever the TTS worker has finished to the wire.
+
+            block=True waits for at least one finished chunk, then keeps
+            draining NON-blocking. The block must not persist past the
+            first get: with a blocking get on every iteration, drain
+            looped back onto the emptied queue after the final chunk and
+            hung forever — the worker had already exited via the None
+            sentinel, so nothing would ever arrive. That deadlocked the
+            post-generation `while emitted < n_sent` loop and the done
+            line never shipped.
+            """
+            nonlocal emitted
+            while True:
+                try:
+                    item = out.get(timeout=120) if block else out.get(block=False)
+                except queue.Empty:
+                    if block:
+                        # 120s with no chunk while we were told more are
+                        # coming — surface as a stream error, not a hang.
+                        raise RuntimeError("timed out waiting for TTS chunk")
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                i, sentence, wav = item
+                self._stream_line({"type": "chunk", "i": i,
+                                   "text": sentence, "audio": wav})
+                emitted += 1
+                block = False  # only the first get may block
 
         parts: list[str] = []
         pending = ""
@@ -293,21 +336,37 @@ class Handler(BaseHTTPRequestHandler):
                 if sentence:
                     ready.put((n_sent, sentence))
                     n_sent += 1
+            drain()  # flush anything TTS finished between tokens
         tail = pending.strip()
         if tail and n_sent < max_chunks:
             ready.put((n_sent, tail))
             n_sent += 1
         ready.put(None)
+        while emitted < n_sent:  # worker may still be synthesizing the tail
+            drain(block=True)
         worker.join()
-        if errors:
-            raise errors[0]
-        reply = "".join(parts).strip()
-        return reply, [wavs[i] for i in range(n_sent)]
+        return "".join(parts).strip(), n_sent
 
-    def _stream_wavs(self, wavs):
-        """Emit one NDJSON chunk line per pre-synthesized WAV."""
-        for i, audio in enumerate(wavs):
-            self._stream_line({"type": "chunk", "i": i, "n": len(wavs), "audio": audio})
+    def _stream_reply(self, text, history, sid, voice_info, transcript=None):
+        """Shared NDJSON v2 flow for /api/ask and /api/talk: meta → live
+        chunks (voice + session turn) → done. Errors mid-stream become an
+        NDJSON error line instead of an HTTP 500."""
+        voice, speaker, speed = voice_info["voice"], voice_info["speaker"], voice_info["speed"]
+        self._stream_begin()
+        meta = {"type": "meta", "voice": voice_info}
+        if transcript is not None:
+            meta["transcript"] = transcript
+        self._stream_line(meta)
+        try:
+            reply, n_sent = self._stream_pipeline(
+                text, history, speed=speed, voice=voice, speaker=speaker)
+        except Exception as e:
+            self._stream_line({"type": "error", "message": str(e)})
+            return
+        import sessions
+        n = sessions.append_turn(sid, text, reply) if sid else 0
+        self._stream_line({"type": "done", "reply": reply, "sentences": n_sent,
+                           "turns": n // 2, "voice": voice_info})
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
@@ -362,20 +421,9 @@ class Handler(BaseHTTPRequestHandler):
                 voice_info = {"voice": voice, "speaker": speaker, "speed": speed}
 
                 if payload.get("stream"):
-                    # pre-warmed: LLM streams, TTS synthesizes each sentence
-                    # as it completes — no serial LLM-then-TTS wait
-                    reply, wavs = self._pipelined_llm_tts(
-                        text, history, speed=speed, voice=voice, speaker=speaker)
-                    import sessions
-                    n = sessions.append_turn(sid, text, reply) if sid else 0
-                    self._stream_begin()
-                    self._stream_line({
-                        "type": "meta", "reply": reply,
-                        "sentences": len(wavs), "turns": n // 2,
-                        "voice": voice_info,
-                    })
-                    self._stream_wavs(wavs)
-                    self._stream_line({"type": "done", "turns": n // 2, "voice": voice_info})
+                    # true streaming: meta goes out now, chunks hit the wire
+                    # as each sentence's TTS finishes (mid-generation)
+                    self._stream_reply(text, history, sid, voice_info)
                     return
 
                 import tempfile
@@ -427,20 +475,8 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 assert transcript is not None  # not gated ⇒ transcript survived
 
-                reply, wavs = self._pipelined_llm_tts(
-                    transcript, history or None,
-                    speed=speed, voice=voice, speaker=speaker)
-                import sessions
-                n = sessions.append_turn(sid, transcript, reply) if sid else 0
-
-                self._stream_begin()
-                self._stream_line({
-                    "type": "meta", "transcript": transcript, "reply": reply,
-                    "sentences": len(wavs), "turns": n // 2,
-                    "voice": voice_info,
-                })
-                self._stream_wavs(wavs)
-                self._stream_line({"type": "done", "turns": n // 2, "voice": voice_info})
+                self._stream_reply(transcript, history or None, sid, voice_info,
+                                   transcript=transcript)
                 return
 
             result = talk(

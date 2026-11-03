@@ -208,46 +208,77 @@ def main():
         assert c.get("wakeWordHit") is False, f"custom wakeWords ignored: {c}"
         print("✅ custom wakeWords honored")
 
-        # --- streaming TTS: /api/ask + /api/talk with stream:true ---
+        # --- streaming TTS v2: /api/ask + /api/talk with stream:true ---
+        # v2: meta carries NO reply (not generated yet); each chunk line
+        # (audio + sentence text) is written the moment its TTS finishes;
+        # done carries the full reply + sentence count.
         import http.client
 
         def stream_post(path, payload):
+            """POST and read the NDJSON stream line by line.
+            Returns (ctype, msgs, arrival_times)."""
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+            t0 = time.time()
             conn.request("POST", path, body=json.dumps(payload),
                          headers={"Content-Type": "application/json"})
             resp = conn.getresponse()
             ctype = resp.getheader("Content-Type") or ""
-            raw = resp.read().decode()
+            msgs, times = [], []
+            while True:
+                line = resp.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if line:
+                    msgs.append(json.loads(line))
+                    times.append(time.time() - t0)
             conn.close()
-            return ctype, [json.loads(l) for l in raw.splitlines() if l.strip()]
+            return ctype, msgs, times
 
-        ctype, msgs = stream_post("/api/ask", {
+        ctype, msgs, times = stream_post("/api/ask", {
             "text": "Give me three short tips for better sleep.",
             "session": "test-session-" + os.urandom(4).hex(),
             "stream": True,
         })
         assert "ndjson" in ctype, f"expected ndjson, got {ctype}"
         types = [m["type"] for m in msgs]
-        assert types[0] == "meta" and msgs[0].get("reply"), f"bad meta: {types}"
+        assert types[0] == "meta", f"bad first line: {types}"
+        assert msgs[0].get("voice") and "reply" not in msgs[0], \
+            f"v2 meta must carry voice but no reply yet: {msgs[0]}"
+        done = msgs[-1]
         chunks = [m for m in msgs if m["type"] == "chunk"]
-        assert len(chunks) == msgs[0].get("sentences"), \
-            f"chunk count {len(chunks)} != declared {msgs[0].get('sentences')}"
+        assert done["type"] == "done" and done.get("reply") and "turns" in done, \
+            f"done must carry the full reply: {done}"
+        assert len(chunks) == done.get("sentences"), \
+            f"chunk count {len(chunks)} != done.sentences {done.get('sentences')}"
+        # true streaming: meta must hit the wire well before generation ends
+        t_meta, t_done = times[0], times[-1]
+        assert t_done - t_meta > 0.5, \
+            f"meta→done gap {t_done - t_meta:.2f}s — stream waited for full generation?"
+        print(f"✅ /api/ask stream v2: meta at {t_meta:.1f}s, done at {t_done:.1f}s "
+              f"(gap {t_done - t_meta:.1f}s proves live streaming)")
         if len(chunks) < 2:
             # small models sometimes answer in one sentence — force the issue
             # once; the structural invariant above already held either way.
-            ctype, msgs = stream_post("/api/ask", {
+            ctype, msgs, _ = stream_post("/api/ask", {
                 "text": "List three colors. Use exactly three separate sentences, "
                         "one per color, each ending with a period.",
                 "session": "test-session-" + os.urandom(4).hex(),
                 "stream": True,
             })
             chunks = [m for m in msgs if m["type"] == "chunk"]
+            done = msgs[-1]
         assert len(chunks) >= 2, "multi-sentence reply should yield multiple chunks"
         for c in chunks:
             wav = base64.b64decode(c["audio"])
             assert wav[:4] == b"RIFF", "chunk is not a wav"
-        assert types[-1] == "done" and "turns" in msgs[-1], f"no done line: {types}"
-        print(f"✅ /api/ask stream: meta → {len(chunks)} wav chunks → done")
+            assert c.get("text"), "chunk missing its sentence text"
+        assert chunks[0]["i"] == 0 and chunks[-1]["i"] == len(chunks) - 1, \
+            "chunk indexes must be sequential"
+        # progressive text: chunk sentences are reflected in the done reply
+        assert chunks[0]["text"].split()[0] in done["reply"], \
+            f"chunk text not reflected in final reply: {chunks[0]['text']!r}"
+        print(f"✅ /api/ask stream: {len(chunks)} wav chunks, progressive text ok")
 
         # --- pre-warm: LLM tokens must arrive incrementally (that overlap
         # is what lets TTS start on sentence 1 mid-generation) ---
@@ -267,13 +298,16 @@ def main():
         print(f"✅ ask_stream pre-warm: first token {first_tok_at-t0:.1f}s, "
               f"total {total:.1f}s, {len(toks)} token chunks")
 
-        # talk streaming carries the transcript in meta
+        # talk streaming carries the transcript in meta; full reply in done
         with open(os.path.join(ROOT, "test", "test.wav"), "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
-        ctype, msgs = stream_post("/api/talk", {"audio": b64, "history": [], "stream": True})
+        ctype, msgs, _ = stream_post("/api/talk", {"audio": b64, "history": [], "stream": True})
         assert "ndjson" in ctype, f"talk stream expected ndjson, got {ctype}"
         assert msgs[0]["type"] == "meta" and msgs[0].get("transcript"), \
             f"talk stream meta missing transcript: {msgs[0]}"
+        assert "reply" not in msgs[0], "v2 meta must not wait for the reply"
+        assert msgs[-1]["type"] == "done" and msgs[-1].get("reply"), \
+            f"talk stream done missing reply: {msgs[-1]}"
         assert any(m["type"] == "chunk" for m in msgs), "talk stream had no audio"
         print(f"✅ /api/talk stream: transcript={msgs[0]['transcript']!r}, "
               f"{sum(1 for m in msgs if m['type'] == 'chunk')} chunks")

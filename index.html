@@ -184,8 +184,10 @@ async function playChunk(b64) {
 
 /**
  * POST with stream:true. The server either answers plain JSON (wake-word
- * gate / errors / legacy) or streams NDJSON: meta → chunk* → done.
- * handlers: {meta, chunk, done} — awaited in arrival order.
+ * gate / errors / legacy) or streams NDJSON v2: meta (voice, transcript?)
+ * → chunk* (audio + sentence text, each sent the moment its TTS finishes)
+ * → done (full reply + counts). handlers: {meta, chunk, done} — awaited
+ * in arrival order.
  */
 async function requestMaybeStream(url, payload, handlers) {
   const r = await fetch(url, {
@@ -224,7 +226,8 @@ function addMsg(who, text, audioB64) {
   const w = document.createElement('div');
   w.className = 'who'; w.textContent = who === 'you' ? 'you' : 'hermes';
   div.appendChild(w);
-  div.appendChild(document.createTextNode(text));
+  const textNode = document.createTextNode(text);
+  div.appendChild(textNode);
   if (audioB64) {
     const bytes = atob(audioB64);
     const arr = new Uint8Array(bytes.length);
@@ -236,6 +239,7 @@ function addMsg(who, text, audioB64) {
   }
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
+  return { div, textNode }; // streaming handlers grow the text node live
 }
 
 function setStatus(t) { statusEl.textContent = t; }
@@ -371,18 +375,28 @@ async function sendAudio(b64) {
   busy = true; micBtn.disabled = true;
   let ok = false;
   nextPlayTime = 0;
+  let bubble = null, heard = 0;
   try {
     const json = await requestMaybeStream('/api/talk',
       { audio: b64, session: sessionId, handsFree, ...voicePayload() },
       {
         meta: (m) => {
           addMsg('you', m.transcript);
-          addMsg('hermes', m.reply); // text now; audio streams in per-sentence
+          bubble = addMsg('hermes', ''); // grows live as chunks arrive
           showVoice(m.voice);
         },
         chunk: async (m) => {
-          setStatus(`speaking… (${m.i + 1}/${m.n})`);
+          heard++;
+          if (bubble && m.text) {
+            bubble.textNode.textContent += (bubble.textNode.textContent ? ' ' : '') + m.text;
+            log.scrollTop = log.scrollHeight;
+          }
+          setStatus(`speaking… (sentence ${m.i + 1})`);
           await playChunk(m.audio);
+        },
+        done: (m) => {
+          if (bubble && m.reply) bubble.textNode.textContent = m.reply;
+          showVoice(m.voice);
         },
       });
     if (json) {
@@ -415,13 +429,22 @@ async function sendText() {
   setStatus('thinking…');
   nextPlayTime = 0;
   let heardChunk = false;
+  let bubble = null;
   try {
     const json = await requestMaybeStream('/api/ask', { text: t, session: sessionId, ...voicePayload() }, {
-      meta: (m) => { addMsg('hermes', m.reply); showVoice(m.voice); },
+      meta: (m) => { bubble = addMsg('hermes', ''); showVoice(m.voice); },
       chunk: async (m) => {
         heardChunk = true;
-        setStatus(`speaking… (${m.i + 1}/${m.n})`);
+        if (bubble && m.text) {
+          bubble.textNode.textContent += (bubble.textNode.textContent ? ' ' : '') + m.text;
+          log.scrollTop = log.scrollHeight;
+        }
+        setStatus(`speaking… (sentence ${m.i + 1})`);
         await playChunk(m.audio);
+      },
+      done: (m) => {
+        if (bubble && m.reply) bubble.textNode.textContent = m.reply;
+        showVoice(m.voice);
       },
     });
     if (json && json.reply) { addMsg('hermes', json.reply, json.audio); showVoice(json.voice); }
