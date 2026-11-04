@@ -31,6 +31,12 @@ Serves a single-page browser UI and the voice pipeline API:
                              converges mid-speech, and the final decode is
                              ready the moment you stop talking.
     GET  /api/voices       → installed voice models + libritts speaker presets
+    POST /api/wake         → JSON {audio: base64 16kHz mono wav}
+                             → {awake: bool, keyword: string|null}
+                             Audio-native wake-word detection (sherpa KWS,
+                             3.3M params) — no STT, sub-second. This is the
+                             always-on gate: cheap enough to run on every
+                             mic frame. 503 when the KWS model is missing.
 
     Voice prefs: per-request fields win; otherwise the session's saved
     profile applies (persisted in data/sessions.json alongside history).
@@ -142,8 +148,8 @@ def decode_samples(samples_f32):
         return stream.result.text.strip()
 
 
-def transcribe(audio_b64):
-    """wav → text. Shared by the streaming and buffered talk paths."""
+def load_wav_samples(audio_b64):
+    """base64 16kHz mono wav → float32 samples. Shared by STT and KWS."""
     import tempfile
     import numpy as np
 
@@ -157,7 +163,12 @@ def transcribe(audio_b64):
         assert f.getframerate() == 16000 and f.getnchannels() == 1, "need 16kHz mono wav"
         samples = np.frombuffer(f.readframes(f.getnframes()), dtype=np.int16)
 
-    return decode_samples(samples.astype("float32") / 32768.0)
+    return samples.astype("float32") / 32768.0
+
+
+def transcribe(audio_b64):
+    """wav → text. Shared by the streaming and buffered talk paths."""
+    return decode_samples(load_wav_samples(audio_b64))
 
 
 # --- live partial STT ---------------------------------------------------
@@ -495,6 +506,25 @@ class Handler(BaseHTTPRequestHandler):
             if final:
                 resp.update({"final": True, "transcript": text})
             self._send(200, json.dumps(resp))
+            return
+
+        if self.path == "/api/wake":
+            # Audio-native wake-word gate: KWS on raw audio, no STT.
+            import kws
+            if not kws.available():
+                self._send(503, json.dumps({
+                    "error": "KWS model missing — see README models section"}))
+                return
+            try:
+                samples = load_wav_samples(payload.get("audio") or "")
+                with _lock:  # sherpa spotters are not thread-safe
+                    keyword = kws.detect(samples)
+                self._send(200, json.dumps({"awake": keyword is not None,
+                                            "keyword": keyword}))
+            except AssertionError as e:
+                self._send(400, json.dumps({"error": str(e)}))
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}))
             return
 
         if self.path == "/api/ask":

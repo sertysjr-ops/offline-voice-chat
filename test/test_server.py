@@ -489,6 +489,42 @@ def main():
             f"/api/ask hands-free wake word should answer: {g2}"
         print(f"✅ /api/ask + handsFree: wake word → answer {g2['reply'][:40]!r}")
 
+        # --- /api/wake: audio-native KWS wake-word detection (no STT) ---
+        import kws
+        assert kws.available(), "KWS model missing — see README"
+
+        def wake_wav(path):
+            with open(os.path.join(ROOT, "test", path), "rb") as f:
+                b = base64.b64encode(f.read()).decode()
+            t0 = time.time()
+            raw = subprocess.run(
+                ["curl", "-s", "-m", "30", "-X", "POST",
+                 f"http://127.0.0.1:{port}/api/wake",
+                 "-H", "Content-Type: application/json",
+                 "-d", json.dumps({"audio": b})],
+                capture_output=True, text=True).stdout
+            return json.loads(raw), time.time() - t0
+
+        kw, kdt = wake_wav("wake.wav")
+        assert kw.get("awake") is True and kw.get("keyword"), \
+            f"KWS missed the wake word: {kw}"
+        print(f"✅ /api/wake: wake.wav → awake, keyword={kw['keyword']!r} ({kdt:.1f}s)")
+
+        kn, ndt = wake_wav("nowake.wav")
+        assert kn.get("awake") is False and kn.get("keyword") is None, \
+            f"KWS false positive: {kn}"
+        print(f"✅ /api/wake: nowake.wav → silent ({ndt:.1f}s)")
+
+        # KWS is the always-on gate — it must be cheaper than the STT gate
+        assert kdt < 5 and ndt < 5, \
+            f"KWS too slow for always-on: {kdt:.1f}s/{ndt:.1f}s"
+        print("✅ /api/wake latency within always-on budget")
+
+        # unit-level: detect() on raw float32 agrees with the endpoint
+        samples, sr = kws.read_wav(os.path.join(ROOT, "test", "wake.wav"))
+        assert kws.detect(kws.resample_16k(samples, sr)), "unit detect() missed"
+        print("✅ kws.detect unit-level (wav → float32 → keyword)")
+
         # index.html live-partial wiring
         html3 = subprocess.run(
             ["curl", "-s", "-m", "5", f"http://127.0.0.1:{port}/"],

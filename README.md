@@ -15,8 +15,12 @@ uv pip install --python .venv/bin/python sherpa-onnx sounddevice numpy
 #   whisper tiny.en  → models/sherpa-onnx-whisper-tiny.en/
 #   piper lessac     → voices/vits-piper-en_US-lessac-medium/
 #   piper libritts   → voices/vits-piper-en_US-libritts_r-medium/  (904 speakers)
+#   kws gigaspeech   → models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01/
 curl -sL -o /tmp/libritts.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-libritts_r-medium.tar.bz2 \
   && tar -xjf /tmp/libritts.tar.bz2 -C voices/ && rm /tmp/libritts.tar.bz2
+# always-on wake-word detector (KWS, ~14MB):
+curl -sL -o /tmp/kws.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2 \
+  && tar -xjf /tmp/kws.tar.bz2 -C models/ && rm /tmp/kws.tar.bz2
 ```
 
 Requires [Ollama](https://ollama.com) running with `qwen3.5:4b` pulled (`ollama pull qwen3.5:4b`).
@@ -43,7 +47,20 @@ Requires [Ollama](https://ollama.com) running with `qwen3.5:4b` pulled (`ollama 
 - `POST /api/talk`    → `{audio, session?, handsFree?, speed?, voice?, speaker?}` → `{transcript, reply, audio, voice}`
 - `POST /api/ask`     → `{text, session?, speed?, voice?, speaker?}` → `{reply, audio, voice}` (text-only path, skips STT)
 - `GET  /api/voices`  → installed voice models + named speaker presets (`libritts:nova`, `:forge`, `:pixel`, `:onyx`, `:wisp`)
+- `POST /api/wake`    → `{audio}` → `{awake, keyword}` — audio-native wake-word detection via sherpa KWS (3.3M params, ~0.5s, no STT). The always-on gate: cheap enough to run on every mic frame. `503` if the KWS model isn't downloaded.
 - `GET  /api/health`  → `{ok, models}`
+
+### Wake words: two gates
+
+- **`wakeword.py`** (transcript gate) — STT first, then string-match "hey hermes".
+  Flexible (custom `wakeWords` per request) but pays full STT latency on every
+  frame and can miss when whisper garbles the phrase.
+- **`kws.py`** (audio gate) — keyword spotting directly on raw audio. Fast
+  (~0.5s), robust to STT mishearings, this is what an always-on listener
+  should run. Keywords live in `keywords.txt` (BPE-tokenized; add phrases
+  with `.venv/bin/python bin/gen_keywords.py "OK HERMES"` — needs
+  `sentencepiece` in the venv, build-time only).
+- Try it: `.venv/bin/python kws.py test/wake.wav test/nowake.wav`
 
 Voice prefs: per-request `speed` (0.5–2.5×) and `voice`/`speaker` win; otherwise the
 session's saved profile applies (persisted server-side in `data/sessions.json`).
