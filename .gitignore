@@ -6,3 +6,4 @@ voices/
 data/
 test/*.wav
 test/*.aiff
+out.wav
