@@ -22,6 +22,14 @@ Serves a single-page browser UI and the voice pipeline API:
                              → {reply, audio, turns, voice}
                              "stream": true → same NDJSON protocol minus transcript.
     POST /api/clear        → JSON {session} → {ok}   (wipe conversation)
+    POST /api/stt/partial  → JSON {stream: id, pcm: base64 s16le 16k mono,
+                             final?: bool}
+                             → {partial, seconds, decoded}
+                             final=True → +{transcript, final:true}, buffer freed.
+                             The browser streams chunks WHILE recording; the
+                             growing buffer is re-decoded so the transcript
+                             converges mid-speech, and the final decode is
+                             ready the moment you stop talking.
     GET  /api/voices       → installed voice models + libritts speaker presets
 
     Voice prefs: per-request fields win; otherwise the session's saved
@@ -124,6 +132,16 @@ def resolve_voice(payload, sid=None):
     return voice, speaker, speed
 
 
+def decode_samples(samples_f32):
+    """float32 16kHz mono samples → text. The one whisper call site."""
+    with _lock:  # sherpa recognizers are not thread-safe
+        recognizer = get_recognizer()
+        stream = recognizer.create_stream()
+        stream.accept_waveform(16000, samples_f32)
+        recognizer.decode_stream(stream)
+        return stream.result.text.strip()
+
+
 def transcribe(audio_b64):
     """wav → text. Shared by the streaming and buffered talk paths."""
     import tempfile
@@ -139,12 +157,56 @@ def transcribe(audio_b64):
         assert f.getframerate() == 16000 and f.getnchannels() == 1, "need 16kHz mono wav"
         samples = np.frombuffer(f.readframes(f.getnframes()), dtype=np.int16)
 
-    with _lock:  # sherpa recognizers are not thread-safe
-        recognizer = get_recognizer()
-        stream = recognizer.create_stream()
-        stream.accept_waveform(16000, samples.astype("float32") / 32768.0)
-        recognizer.decode_stream(stream)
-        return stream.result.text.strip()
+    return decode_samples(samples.astype("float32") / 32768.0)
+
+
+# --- live partial STT ---------------------------------------------------
+# The browser streams raw s16le PCM chunks WHILE recording; each chunk is
+# appended to a per-stream buffer and the whole buffer is re-decoded, so
+# the transcript converges as you speak. On final=True the decode is the
+# definitive one and the client can go straight to /api/ask with the text,
+# skipping the record-then-decode wait entirely.
+_partial_lock = threading.Lock()
+_partials: dict[str, dict] = {}  # stream_id -> {pcm, text, decoded}
+PARTIAL_MAX_BYTES = 16000 * 2 * 30       # 30s of s16le 16kHz mono
+PARTIAL_MIN_NEW = int(16000 * 2 * 0.7)   # don't re-decode for <0.7s of new audio
+PARTIAL_MAX_STREAMS = 20
+
+
+def partial_transcribe(stream_id, pcm_bytes, final=False):
+    """Append PCM to the stream's buffer, re-decode if enough new audio.
+
+    Returns (text, seconds_buffered, did_decode). final=True always decodes
+    and drops the buffer afterwards.
+    """
+    with _partial_lock:
+        st = _partials.setdefault(stream_id, {"pcm": bytearray(), "text": "", "decoded": 0})
+        st["pcm"] += pcm_bytes
+        if len(st["pcm"]) > PARTIAL_MAX_BYTES:  # sliding window, keep the tail
+            overflow = len(st["pcm"]) - PARTIAL_MAX_BYTES
+            del st["pcm"][:overflow]
+            st["decoded"] = max(0, st["decoded"] - overflow)
+        if not final and (len(st["pcm"]) - st["decoded"]) < PARTIAL_MIN_NEW:
+            return st["text"], len(st["pcm"]) / 32000.0, False
+        pcm = bytes(st["pcm"])
+        while len(_partials) > PARTIAL_MAX_STREAMS:  # evict oldest
+            _partials.pop(next(iter(_partials)))
+
+    import numpy as np
+    if pcm:
+        samples = np.frombuffer(pcm, dtype=np.int16).astype("float32") / 32768.0
+        text = decode_samples(samples)
+    else:
+        text = ""
+
+    with _partial_lock:
+        st = _partials.get(stream_id)
+        if st is not None:
+            st["text"] = text
+            st["decoded"] = len(pcm)  # snapshot length, not live length
+            if final:
+                del _partials[stream_id]
+    return text, len(pcm) / 32000.0, True
 
 
 def apply_wake_gate(transcript, hands_free=False, wake_words=None):
@@ -409,12 +471,47 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": True, "session": sid, "turns": 0}))
             return
 
+        if self.path == "/api/stt/partial":
+            # Live partial STT: the browser feeds raw s16le PCM (16kHz mono)
+            # while recording; we re-decode the growing buffer so the
+            # transcript converges mid-speech. final=True returns the
+            # definitive transcript and frees the buffer.
+            stream_id = (payload.get("stream") or "").strip()[:64]
+            if not stream_id:
+                self._send(400, '{"error": "stream id required"}')
+                return
+            try:
+                pcm = base64.b64decode(payload.get("pcm") or "", validate=True)
+            except Exception:
+                self._send(400, '{"error": "pcm must be base64 s16le"}')
+                return
+            final = bool(payload.get("final"))
+            try:
+                text, secs, did_decode = partial_transcribe(stream_id, pcm, final)
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}))
+                return
+            resp = {"partial": text, "seconds": round(secs, 2), "decoded": did_decode}
+            if final:
+                resp.update({"final": True, "transcript": text})
+            self._send(200, json.dumps(resp))
+            return
+
         if self.path == "/api/ask":
             # text-only path: skip STT, LLM → TTS
             text = (payload.get("text") or "").strip()
             if not text:
                 self._send(400, '{"error": "text required"}')
                 return
+            # hands-free clients that already have a transcript (live partial
+            # STT path) still get the wake-word gate, server-side
+            if payload.get("handsFree"):
+                gated, cleaned = apply_wake_gate(
+                    text, True, payload.get("wakeWords") or None)
+                if gated:
+                    self._send(200, json.dumps(gated))
+                    return
+                text = cleaned
             try:
                 history, sid = _resolve_history(payload)
                 voice, speaker, speed = resolve_voice(payload, sid)

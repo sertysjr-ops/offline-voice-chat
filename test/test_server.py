@@ -406,6 +406,97 @@ def main():
         for token in ("voiceSel", "voicePayload", "/api/voices", 'id="speed"'):
             assert token in html2, f"voice UI wiring missing: {token!r}"
         print("✅ index.html voice controls (selector + speed slider) wired")
+
+        # --- live partial STT: stream PCM chunks, transcript converges ---
+        def partial(payload):
+            raw = subprocess.run(
+                ["curl", "-s", "-m", "60", "-X", "POST",
+                 f"http://127.0.0.1:{port}/api/stt/partial",
+                 "-H", "Content-Type: application/json",
+                 "-d", json.dumps(payload)],
+                capture_output=True, text=True).stdout
+            return json.loads(raw)
+
+        # wake.wav is the longest fixture (2.25s) — split its raw PCM at a
+        # 2-byte boundary and feed it in two chunks, like the browser does
+        import wave as _wave
+        with _wave.open(os.path.join(ROOT, "test", "wake.wav"), "rb") as f:
+            raw_pcm = f.readframes(f.getnframes())
+        half = (len(raw_pcm) // 2) & ~1  # keep the split sample-aligned
+        psid = "partial-" + os.urandom(4).hex()
+
+        p1 = partial({"stream": psid,
+                      "pcm": base64.b64encode(raw_pcm[:half]).decode()})
+        assert "partial" in p1 and p1.get("seconds", 0) > 1.0, \
+            f"first partial chunk bad: {p1}"
+        # 1.1s of new audio ≥ the 0.7s threshold → a real decode happened
+        assert p1.get("decoded") is True, f"expected decode on ≥0.7s new audio: {p1}"
+        print(f"✅ partial chunk 1: {p1['seconds']}s buffered, decoded={p1['decoded']}, "
+              f"partial={p1['partial']!r}")
+
+        p2 = partial({"stream": psid,
+                      "pcm": base64.b64encode(raw_pcm[half:]).decode(),
+                      "final": True})
+        assert p2.get("final") is True and p2.get("transcript"), \
+            f"final partial missing transcript: {p2}"
+        # determinism check: whisper on the same concatenated audio must
+        # match the /api/talk transcript of the whole wav
+        assert "time" in p2["transcript"].lower(), \
+            f"partial-final transcript off: {p2['transcript']!r}"
+        print(f"✅ partial final: transcript={p2['transcript']!r} "
+              f"(deltas concatenated == whole-file decode)")
+
+        # buffer freed after final — same stream id starts empty
+        p3 = partial({"stream": psid, "pcm": "", "final": True})
+        assert p3.get("transcript") == "", \
+            f"buffer should be freed after final: {p3}"
+        print("✅ partial buffer freed after final decode")
+
+        # tiny appends below the 0.7s threshold don't trigger a re-decode
+        p4 = partial({"stream": psid + "b",
+                      "pcm": base64.b64encode(raw_pcm[:1600]).decode()})  # 0.05s
+        assert p4.get("decoded") is False, f"tiny append should skip decode: {p4}"
+        print("✅ sub-threshold append skips re-decode (decoded=false)")
+
+        # validation
+        import urllib.request
+        import urllib.error
+        def partial_status(payload):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/stt/partial",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status
+            except urllib.error.HTTPError as e:
+                return e.code
+        assert partial_status({"pcm": "eA=="}) == 400, "missing stream id → 400"
+        assert partial_status({"stream": "x", "pcm": "!!!notb64"}) == 400, \
+            "bad base64 → 400"
+        print("✅ /api/stt/partial validation (stream id + base64)")
+
+        # --- hands-free gate on /api/ask (the live-partial fast path) ---
+        g1 = ask_json({"text": "what time is it right now", "handsFree": True})
+        assert g1.get("wakeWordHit") is False and g1.get("reply") is None, \
+            f"/api/ask hands-free gate failed: {g1}"
+        print("✅ /api/ask + handsFree: no wake word → silent gate")
+
+        g2 = ask_json({"text": "hey hermes, reply with exactly: OK.",
+                       "handsFree": True,
+                       "session": "test-hf-" + os.urandom(4).hex()})
+        assert g2.get("reply") and g2.get("audio"), \
+            f"/api/ask hands-free wake word should answer: {g2}"
+        print(f"✅ /api/ask + handsFree: wake word → answer {g2['reply'][:40]!r}")
+
+        # index.html live-partial wiring
+        html3 = subprocess.run(
+            ["curl", "-s", "-m", "5", f"http://127.0.0.1:{port}/"],
+            capture_output=True, text=True).stdout
+        for token in ("sendPartial", "/api/stt/partial", "recStreamId",
+                      "askTranscript"):
+            assert token in html3, f"live-partial wiring missing: {token!r}"
+        print("✅ index.html live-partial STT wiring present")
         return 0
     finally:
         proc.kill()

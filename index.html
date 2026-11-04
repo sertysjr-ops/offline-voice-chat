@@ -287,6 +287,58 @@ let silentSince = null, recStart = 0;
 let pttActive = false;       // push-to-talk: hold SPACE, release to send
 const MAX_MS = 15000, SILENCE_MS = 1400, THRESH = 0.015;
 
+/* Live partial STT: while recording, we ship 16k PCM deltas to
+ * /api/stt/partial every 1.5s. The server re-decodes the growing buffer,
+ * so by the time you stop talking the transcript is already decoded —
+ * stopRec goes straight to the LLM with text and skips the STT wait. */
+let recStreamId = null, partialSent = 0, partialTimer = null;
+
+function pcm16Bytes(samples) {
+  const buf = new ArrayBuffer(samples.length * 2);
+  const v = new DataView(buf);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return new Uint8Array(buf);
+}
+
+/* Merge + resample everything captured so far → Float32Array @16k. */
+function currentPcm16k() {
+  const inputRate = ctx.sampleRate;
+  const total = recChunks.reduce((n, c) => n + c.length, 0);
+  const merged = new Float32Array(total);
+  let off = 0;
+  for (const c of recChunks) { merged.set(c, off); off += c.length; }
+  const ratio = 16000 / inputRate;
+  const outLen = Math.floor(total * ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i / ratio, i0 = Math.floor(pos), i1 = Math.min(i0 + 1, total - 1);
+    out[i] = merged[i0] + (merged[i1] - merged[i0]) * (pos - i0);
+  }
+  return out;
+}
+
+async function sendPartial(final = false, samples = null) {
+  if (!recStreamId) return null;
+  // `samples` lets stopRec pass the buffer captured BEFORE teardown —
+  // recChunks is already cleared by then, so recomputing would be empty.
+  const out = samples || currentPcm16k();
+  const from = partialSent;
+  if (!final && out.length - from < 16000 * 0.8) return null; // need ≥0.8s new
+  partialSent = out.length;
+  const delta = pcm16Bytes(out.subarray(from));
+  const r = await fetch('/api/stt/partial', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stream: recStreamId, pcm: b64encode(delta), final }),
+  });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  if (!final && d.partial && recording) setStatus('hearing: “' + d.partial + '”');
+  return d;
+}
+
 micBtn.addEventListener('click', () => { recording ? stopRec() : startRec(); });
 
 /* Push-to-talk: hold SPACE to record, release to send. While held, the
@@ -321,6 +373,9 @@ async function startRec() {
   recChunks = [];
   silentSince = null;
   recStart = performance.now();
+  recStreamId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random();
+  partialSent = 0;
+  partialTimer = setInterval(() => { sendPartial(false).catch(() => {}); }, 1500);
 
   node.onaudioprocess = (e) => {
     const d = e.inputBuffer.getChannelData(0);
@@ -343,32 +398,91 @@ async function startRec() {
   setStatus(pttActive ? 'recording… release SPACE to send' : 'listening… (auto-stops on silence)');
 }
 
-function stopRec() {
+async function stopRec() {
   if (!recording) return;
   recording = false;
+  clearInterval(partialTimer); partialTimer = null;
   micBtn.classList.remove('rec');
   meterFill.style.width = '0%';
   const inputRate = ctx.sampleRate;
   const total = recChunks.reduce((n, c) => n + c.length, 0);
-  const merged = new Float32Array(total);
-  let off = 0;
-  for (const c of recChunks) { merged.set(c, off); off += c.length; }
+  const out = currentPcm16k();   // 16k Float32, before we tear down ctx
   recChunks = [];
   node.disconnect(); ctx.close();
   stream.getTracks().forEach(t => t.stop());
   const secs = total / inputRate;
-  if (secs < 0.4) { setStatus('too short — try again'); return; }
-  // linear resample to 16kHz
-  const ratio = 16000 / inputRate;
-  const outLen = Math.floor(total * ratio);
-  const out = new Float32Array(outLen);
-  for (let i = 0; i < outLen; i++) {
-    const pos = i / ratio, i0 = Math.floor(pos), i1 = Math.min(i0 + 1, total - 1);
-    out[i] = merged[i0] + (merged[i1] - merged[i0]) * (pos - i0);
+  if (secs < 0.4) {
+    setStatus('too short — try again');
+    // still free the server-side buffer for this stream
+    try { await sendPartial(true, out); } catch {}
+    recStreamId = null;
+    return;
   }
-  const wav = encodeWav(out);
   setStatus(`heard ${secs.toFixed(1)}s — thinking…`);
-  sendAudio(b64encode(wav));
+  // Fast path: the final partial decode IS the full-utterance decode
+  // (the server kept appending our deltas), so we get the transcript
+  // back immediately and go straight to the LLM — no STT wait.
+  try {
+    const d = await sendPartial(true, out);
+    recStreamId = null;
+    const transcript = (d && d.transcript || '').trim();
+    if (!transcript) {
+      setStatus("didn't catch that — try again");
+      if (handsFree) setTimeout(() => { if (handsFree && !busy && !recording) startRec(); }, 1200);
+      return;
+    }
+    askTranscript(transcript);
+    return;
+  } catch {
+    // older server without /api/stt/partial — fall back to the WAV path
+    recStreamId = null;
+    sendAudio(b64encode(encodeWav(out)));
+  }
+}
+
+/* We already have the transcript (live partial STT) — skip STT entirely
+ * and run the same streaming LLM→TTS flow as typed input. */
+async function askTranscript(transcript) {
+  busy = true; micBtn.disabled = true;
+  let ok = false;
+  nextPlayTime = 0;
+  let bubble = null;
+  addMsg('you', transcript);
+  try {
+    const json = await requestMaybeStream('/api/ask',
+      { text: transcript, session: sessionId, handsFree, ...voicePayload() },
+      {
+        meta: (m) => { bubble = addMsg('hermes', ''); showVoice(m.voice); },
+        chunk: async (m) => {
+          if (bubble && m.text) {
+            bubble.textNode.textContent += (bubble.textNode.textContent ? ' ' : '') + m.text;
+            log.scrollTop = log.scrollHeight;
+          }
+          setStatus(`speaking… (sentence ${m.i + 1})`);
+          await playChunk(m.audio);
+        },
+        done: (m) => {
+          if (bubble && m.reply) bubble.textNode.textContent = m.reply;
+          showVoice(m.voice);
+        },
+      });
+    if (json) {
+      if (json.wakeWordHit === false) {
+        ok = true;
+        setStatus(`heard “${json.transcript}” — say “hey hermes” first`);
+        return;
+      }
+      if (json.reply) addMsg('hermes', json.reply, json.audio);
+      showVoice(json.voice);
+    }
+    setStatus(handsFree ? 'listening… (hands-free)' : 'hold SPACE to talk, or type below');
+    ok = true;
+  } catch (err) {
+    setStatus('⚠ ' + err.message);
+  } finally {
+    busy = false; micBtn.disabled = false;
+    if (handsFree && ok) setTimeout(() => { if (handsFree && !busy && !recording) startRec(); }, 1200);
+  }
 }
 
 async function sendAudio(b64) {
