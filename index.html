@@ -292,6 +292,7 @@ const MAX_MS = 15000, SILENCE_MS = 1400, THRESH = 0.015;
  * so by the time you stop talking the transcript is already decoded —
  * stopRec goes straight to the LLM with text and skips the STT wait. */
 let recStreamId = null, partialSent = 0, partialTimer = null;
+let kwsAvailable = true;  // flips off on 503 so we stop paying the roundtrip
 
 function pcm16Bytes(samples) {
   const buf = new ArrayBuffer(samples.length * 2);
@@ -423,8 +424,24 @@ async function stopRec() {
   // (the server kept appending our deltas), so we get the transcript
   // back immediately and go straight to the LLM — no STT wait.
   try {
-    const d = await sendPartial(true, out);
+    // Hands-free only: audio-native KWS pre-gate (sherpa, ~0.1s) runs
+    // CONCURRENTLY with the final decode. A reject here never shows a
+    // bubble and never touches the LLM — the server-side transcript gate
+    // in /api/ask stays on as the second layer for KWS false-positives.
+    const wakeP = (handsFree && kwsAvailable)
+      ? fetch('/api/wake', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ audio: b64encode(encodeWav(out)) }),
+        }).then(r => r.json()).catch(() => null)
+      : Promise.resolve(null);
+    const [wake, d] = await Promise.all([wakeP, sendPartial(true, out)]);
     recStreamId = null;
+    if (wake && wake.error) kwsAvailable = false; // model missing — stop asking
+    if (wake && wake.awake === false) {
+      setStatus('heard something — not for me (say “hey hermes” first)');
+      if (handsFree) setTimeout(() => { if (handsFree && !busy && !recording) startRec(); }, 900);
+      return;
+    }
     const transcript = (d && d.transcript || '').trim();
     if (!transcript) {
       setStatus("didn't catch that — try again");

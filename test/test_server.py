@@ -533,6 +533,50 @@ def main():
                       "askTranscript"):
             assert token in html3, f"live-partial wiring missing: {token!r}"
         print("✅ index.html live-partial STT wiring present")
+
+        # index.html hands-free KWS pre-gate wiring (browser calls /api/wake
+        # concurrently with the final decode; 503 disables the check)
+        for token in ("/api/wake", "kwsAvailable", "wake.awake === false",
+                      "not for me"):
+            assert token in html3, f"hands-free KWS wiring missing: {token!r}"
+        print("✅ index.html hands-free KWS pre-gate wiring present")
+
+        # --- pipeline.py --kws: audio-native pre-gate in the CLI ---
+        # no-wake fixture → gate rejects, STT+LLM never run (fast exit)
+        t0 = time.time()
+        r = subprocess.run(
+            [PY, os.path.join(ROOT, "pipeline.py"),
+             os.path.join(ROOT, "test", "nowake.wav"), "--text-only", "--kws"],
+            capture_output=True, text=True, timeout=60)
+        kws_dt = time.time() - t0
+        assert r.returncode == 0, f"pipeline --kws crashed: {r.stderr[-300:]}"
+        assert "no wake word" in r.stderr.lower(), \
+            f"gate should report the reject: {r.stderr[-300:]}"
+        assert "Hermes:" not in r.stdout, f"gated run answered: {r.stdout[-200:]}"
+        assert kws_dt < 20, f"gated run too slow (STT leaked in?): {kws_dt:.1f}s"
+        print(f"✅ pipeline --kws: no-wake fixture gated in {kws_dt:.1f}s (no STT/LLM)")
+
+        # wake fixture → gate opens, full STT→LLM reply comes out
+        r2 = subprocess.run(
+            [PY, os.path.join(ROOT, "pipeline.py"),
+             os.path.join(ROOT, "test", "wake.wav"), "--text-only", "--kws"],
+            capture_output=True, text=True, timeout=180)
+        assert r2.returncode == 0, f"pipeline --kws wake run crashed: {r2.stderr[-300:]}"
+        assert "Hermes:" in r2.stdout, \
+            f"wake fixture should produce a reply: {r2.stdout[-200:]}"
+        print(f"✅ pipeline --kws: wake fixture → reply {r2.stdout.strip()[-60:]!r}")
+
+        # kws_gate fails open when the model dir is unreachable
+        import pipeline as pl
+        import kws as kws_mod
+        orig = kws_mod.MODEL_DIR
+        kws_mod.MODEL_DIR = os.path.join(ROOT, "models", "definitely-missing")
+        try:
+            assert pl.kws_gate(os.path.join(ROOT, "test", "nowake.wav")) is True, \
+                "kws_gate must fail open when the model is missing"
+        finally:
+            kws_mod.MODEL_DIR = orig
+        print("✅ kws_gate fails open on missing model (never locks the user out)")
         return 0
     finally:
         proc.kill()
