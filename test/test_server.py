@@ -541,6 +541,51 @@ def main():
             assert token in html3, f"hands-free KWS wiring missing: {token!r}"
         print("✅ index.html hands-free KWS pre-gate wiring present")
 
+        # --- always-on watch: a 2.0s rolling window must still trigger KWS ---
+        # (the browser ships exactly such windows from startWatch/pollWake)
+        import wave, struct
+        samples, sr = kws.read_wav(os.path.join(ROOT, "test", "wake.wav"))
+        s16 = kws.resample_16k(samples, sr)
+        win = s16[: int(16000 * 2.0)]
+        assert len(win) < len(s16), "fixture shorter than the watch window?"
+        tmp = os.path.join(ROOT, "test", ".watchwin.wav")
+        with wave.open(tmp, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+            w.writeframes(b"".join(
+                struct.pack("<h", max(-32768, min(32767, int(x * 32767))))
+                for x in win))
+        try:
+            ww, wdt = wake_wav(".watchwin.wav")
+        finally:
+            os.unlink(tmp)
+        assert ww.get("awake") is True, \
+            f"2s watch window missed the wake word: {ww}"
+        print(f"✅ always-on: 2.0s watch window still triggers KWS ({wdt:.1f}s)")
+
+        # 2s window of the no-wake fixture must NOT false-positive (the watch
+        # loop polls these constantly — a false hit would open the recorder)
+        samples2, sr2 = kws.read_wav(os.path.join(ROOT, "test", "nowake.wav"))
+        s162 = kws.resample_16k(samples2, sr2)
+        win2 = s162[: int(16000 * 2.0)]
+        tmp2 = os.path.join(ROOT, "test", ".watchwin2.wav")
+        with wave.open(tmp2, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+            w.writeframes(b"".join(
+                struct.pack("<h", max(-32768, min(32767, int(x * 32767))))
+                for x in win2))
+        try:
+            wn, _ = wake_wav(".watchwin2.wav")
+        finally:
+            os.unlink(tmp2)
+        assert wn.get("awake") is False, f"2s no-wake window false-positive: {wn}"
+        print("✅ always-on: 2.0s no-wake window stays silent (no false hit)")
+
+        # index.html always-on wiring (watch loop, gate-skip, resume)
+        for token in ("startWatch", "pollWake", "skipGateOnce",
+                      "maybeResumeWatch", "WATCH_WINDOW_S", "stopWatch"):
+            assert token in html3, f"always-on wiring missing: {token!r}"
+        print("✅ index.html always-on wake-watch wiring present")
+
         # --- pipeline.py --kws: audio-native pre-gate in the CLI ---
         # no-wake fixture → gate rejects, STT+LLM never run (fast exit)
         t0 = time.time()

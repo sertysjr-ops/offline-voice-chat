@@ -60,6 +60,7 @@
   <h1>Hermes Voice</h1>
   <button id="newchat" title="New conversation" style="margin-left:12px;background:var(--panel);border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer;">⟲ new chat</button>
   <button id="hf" title="Hands-free: continuously listen, answer only after 'hey hermes'" style="background:var(--panel);border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer;">🖐 hands-free: off</button>
+  <button id="al" title="Always-on: mic watches for the wake word only (cheap KWS, no STT). Say 'hey hermes' and the recorder opens by itself" style="background:var(--panel);border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer;">👂 always-on: off</button>
   <label style="margin-left:10px;display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12px;">
     🎚 <input type="range" id="speed" min="0.5" max="2.5" step="0.1" value="1" style="width:80px;accent-color:var(--acc2);">
     <span id="speedVal">1.0×</span>
@@ -130,6 +131,7 @@ hfBtn.addEventListener('click', () => {
   hfBtn.textContent = `🖐 hands-free: ${handsFree ? 'ON — say "hey hermes"' : 'off'}`;
   hfBtn.style.color = handsFree ? '#22d3ee' : 'var(--dim)';
   hfBtn.style.borderColor = handsFree ? '#22d3ee' : 'var(--line)';
+  if (handsFree && alwaysOn) setAlwaysOn(false);   // one mic loop at a time
   if (!handsFree && recording) stopRec();
   setStatus(handsFree
     ? 'hands-free on — keep the mic open, say "hey hermes, …"'
@@ -340,7 +342,118 @@ async function sendPartial(final = false, samples = null) {
   return d;
 }
 
-micBtn.addEventListener('click', () => { recording ? stopRec() : startRec(); });
+/* ---------- always-on wake watch ----------
+ * The mic listens ONLY for the wake word: a rolling 2s window ships to
+ * /api/wake (sherpa KWS, ~0.1s, no STT, no LLM) every 1.2s. On a hit the
+ * recorder opens by itself and the command comes as the NEXT utterance —
+ * so that turn skips BOTH wake gates (KWS pre-gate + /api/ask transcript
+ * gate) via skipGateOnce. Mutually exclusive with hands-free. */
+const alBtn = document.getElementById('al');
+let alwaysOn = false;
+let wStream = null, wCtx = null, wNode = null, wTimer = null, wChunks = [];
+let wInFlight = false, skipGateOnce = false;
+const WATCH_WINDOW_S = 2.0, WATCH_POLL_MS = 1200;
+
+alBtn.addEventListener('click', () => setAlwaysOn(!alwaysOn));
+
+async function setAlwaysOn(on) {
+  alwaysOn = on;
+  alBtn.textContent = `👂 always-on: ${on ? 'ON — say "hey hermes"' : 'off'}`;
+  alBtn.style.color = on ? '#4ade80' : 'var(--dim)';
+  alBtn.style.borderColor = on ? '#4ade80' : 'var(--line)';
+  if (on) {
+    if (handsFree) hfBtn.click();          // one mic loop at a time
+    if (recording) stopRec();
+    startWatch();
+  } else {
+    stopWatch();
+    setStatus('hold SPACE to talk, or type below');
+  }
+}
+
+async function startWatch() {
+  if (wTimer || !alwaysOn) return;
+  try {
+    wStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    setStatus('⚠ mic denied — always-on needs the mic');
+    setAlwaysOn(false);
+    return;
+  }
+  wCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = wCtx.createMediaStreamSource(wStream);
+  wNode = wCtx.createScriptProcessor(4096, 1, 1);
+  wChunks = [];
+  const cap = Math.ceil(wCtx.sampleRate * (WATCH_WINDOW_S + 0.5));
+  let wLen = 0;
+  wNode.onaudioprocess = (e) => {
+    const d = new Float32Array(e.inputBuffer.getChannelData(0));
+    wChunks.push(d); wLen += d.length;
+    while (wLen > cap) wLen -= wChunks.shift().length;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 8) sum += d[i] * d[i];
+    meterFill.style.width = Math.min(100, Math.sqrt(sum / (d.length / 8)) * 400) + '%';
+  };
+  src.connect(wNode); wNode.connect(wCtx.destination);
+  setStatus('👂 watching for “hey hermes”…');
+  wTimer = setInterval(pollWake, WATCH_POLL_MS);
+}
+
+function stopWatch() {
+  if (wTimer) { clearInterval(wTimer); wTimer = null; }
+  if (wNode) { wNode.disconnect(); wNode = null; }
+  if (wCtx) { wCtx.close(); wCtx = null; }
+  if (wStream) { wStream.getTracks().forEach(t => t.stop()); wStream = null; }
+  wChunks = [];
+  meterFill.style.width = '0%';
+}
+
+function maybeResumeWatch(delayMs = 800) {
+  if (!alwaysOn) return;
+  setTimeout(() => { if (alwaysOn && !busy && !recording) startWatch(); }, delayMs);
+}
+
+async function pollWake() {
+  if (!alwaysOn || wInFlight || recording || busy || !wCtx) return;
+  const inputRate = wCtx.sampleRate;
+  const total = wChunks.reduce((n, c) => n + c.length, 0);
+  if (total < inputRate * 0.8) return;          // not enough audio yet
+  const merged = new Float32Array(total);
+  let off = 0;
+  for (const c of wChunks) { merged.set(c, off); off += c.length; }
+  // resample to 16k (same linear interp as currentPcm16k)
+  const ratio = 16000 / inputRate;
+  const outLen = Math.floor(total * ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i / ratio, i0 = Math.floor(pos), i1 = Math.min(i0 + 1, total - 1);
+    out[i] = merged[i0] + (merged[i1] - merged[i0]) * (pos - i0);
+  }
+  wInFlight = true;
+  try {
+    const r = await fetch('/api/wake', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audio: b64encode(encodeWav(out)) }),
+    });
+    const d = await r.json();
+    if (d.error) {                       // 503: KWS model missing server-side
+      setStatus('⚠ KWS model missing on the server — always-on turned off');
+      setAlwaysOn(false);
+      return;
+    }
+    if (d.awake) {
+      skipGateOnce = true;               // command comes as the next utterance
+      stopWatch();
+      setStatus('👂 wake word heard — say your command');
+      startRec();
+    }
+  } catch {} finally { wInFlight = false; }
+}
+
+micBtn.addEventListener('click', () => {
+  if (!recording && alwaysOn) stopWatch();  // manual turn pauses the watch
+  recording ? stopRec() : startRec();
+});
 
 /* Push-to-talk: hold SPACE to record, release to send. While held, the
  * silence auto-stop is disabled — you decide when the utterance ends.
@@ -349,7 +462,7 @@ window.addEventListener('keydown', (e) => {
   if (e.code !== 'Space' || e.repeat) return;
   if (e.target === textEl) return;            // never steal typing space
   e.preventDefault();                          // no page scroll / button re-click
-  if (pttActive || busy || recording || handsFree) return;
+  if (pttActive || busy || recording || handsFree || alwaysOn) return;
   pttActive = true;
   startRec();
 });
@@ -405,6 +518,9 @@ async function stopRec() {
   clearInterval(partialTimer); partialTimer = null;
   micBtn.classList.remove('rec');
   meterFill.style.width = '0%';
+  // always-on: this turn was opened BY the wake word, so both gates skip
+  const skipGate = skipGateOnce;
+  skipGateOnce = false;
   const inputRate = ctx.sampleRate;
   const total = recChunks.reduce((n, c) => n + c.length, 0);
   const out = currentPcm16k();   // 16k Float32, before we tear down ctx
@@ -417,6 +533,7 @@ async function stopRec() {
     // still free the server-side buffer for this stream
     try { await sendPartial(true, out); } catch {}
     recStreamId = null;
+    maybeResumeWatch(1200);
     return;
   }
   setStatus(`heard ${secs.toFixed(1)}s — thinking…`);
@@ -428,7 +545,8 @@ async function stopRec() {
     // CONCURRENTLY with the final decode. A reject here never shows a
     // bubble and never touches the LLM — the server-side transcript gate
     // in /api/ask stays on as the second layer for KWS false-positives.
-    const wakeP = (handsFree && kwsAvailable)
+    // Skipped when the wake word itself opened this recording (always-on).
+    const wakeP = (handsFree && kwsAvailable && !skipGate)
       ? fetch('/api/wake', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ audio: b64encode(encodeWav(out)) }),
@@ -440,15 +558,17 @@ async function stopRec() {
     if (wake && wake.awake === false) {
       setStatus('heard something — not for me (say “hey hermes” first)');
       if (handsFree) setTimeout(() => { if (handsFree && !busy && !recording) startRec(); }, 900);
+      maybeResumeWatch(900);
       return;
     }
     const transcript = (d && d.transcript || '').trim();
     if (!transcript) {
       setStatus("didn't catch that — try again");
       if (handsFree) setTimeout(() => { if (handsFree && !busy && !recording) startRec(); }, 1200);
+      maybeResumeWatch(1200);
       return;
     }
-    askTranscript(transcript);
+    askTranscript(transcript, skipGate);
     return;
   } catch {
     // older server without /api/stt/partial — fall back to the WAV path
@@ -458,8 +578,9 @@ async function stopRec() {
 }
 
 /* We already have the transcript (live partial STT) — skip STT entirely
- * and run the same streaming LLM→TTS flow as typed input. */
-async function askTranscript(transcript) {
+ * and run the same streaming LLM→TTS flow as typed input. skipGate is set
+ * when always-on's KWS already verified this turn's wake word. */
+async function askTranscript(transcript, skipGate = false) {
   busy = true; micBtn.disabled = true;
   let ok = false;
   nextPlayTime = 0;
@@ -467,7 +588,7 @@ async function askTranscript(transcript) {
   addMsg('you', transcript);
   try {
     const json = await requestMaybeStream('/api/ask',
-      { text: transcript, session: sessionId, handsFree, ...voicePayload() },
+      { text: transcript, session: sessionId, handsFree: handsFree && !skipGate, ...voicePayload() },
       {
         meta: (m) => { bubble = addMsg('hermes', ''); showVoice(m.voice); },
         chunk: async (m) => {
@@ -499,6 +620,8 @@ async function askTranscript(transcript) {
   } finally {
     busy = false; micBtn.disabled = false;
     if (handsFree && ok) setTimeout(() => { if (handsFree && !busy && !recording) startRec(); }, 1200);
+    if (ok) maybeResumeWatch(1200);
+    else maybeResumeWatch(1500); // error path — still resume so the mic isn't dead
   }
 }
 
@@ -547,6 +670,8 @@ async function sendAudio(b64) {
   } finally {
     busy = false; micBtn.disabled = false;
     if (handsFree && ok) setTimeout(() => { if (handsFree && !busy && !recording) startRec(); }, 1200);
+    if (ok) maybeResumeWatch(1200);
+    else maybeResumeWatch(1500);
   }
 }
 
