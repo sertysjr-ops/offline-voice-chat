@@ -18,6 +18,11 @@ Serves a single-page browser UI and the voice pipeline API:
                              while the LLM is still generating later sentences —
                              then a done line with the full reply + sentence
                              count. Playback starts mid-generation.
+                             "stream": "pcm" → NDJSON v3: meta carries
+                             pcm {rate, fragSamples}; each sentence arrives as
+                             sbegin → pcm* (base64 s16le fragments emitted
+                             WHILE the sentence synthesizes, ~0.3s each) →
+                             send. Playback starts mid-synthesis.
     POST /api/ask          → JSON {text, session?, speed?, voice?, speaker?}
                              → {reply, audio, turns, voice}
                              "stream": true → same NDJSON protocol minus transcript.
@@ -327,11 +332,16 @@ class Handler(BaseHTTPRequestHandler):
     _SENT_BOUNDARY = re.compile(r"(?<=[.!?;])\s")
 
     def _stream_pipeline(self, text, history, speed=1.0, voice="lessac",
-                         speaker=0, max_chunks=8):
+                         speaker=0, max_chunks=8, pcm=False):
         """True-streaming LLM→TTS: consumes the token stream, hands each
-        completed sentence to a TTS worker, and writes its chunk line to the
+        completed sentence to a TTS worker, and writes its audio to the
         wire IMMEDIATELY — chunk 1 typically hits the client while the model
         is still generating sentence 2+.
+
+        pcm=False → one WAV chunk line per sentence (NDJSON v2).
+        pcm=True  → NDJSON v3: sbegin → pcm* (raw s16le fragments emitted
+                    WHILE the sentence is synthesized, ~0.3s each) → send.
+                    Playback starts mid-synthesis, not just mid-generation.
 
         Callers must have sent meta already. Returns (full_reply, n_sent).
         Mid-stream TTS failures raise; the caller turns them into an
@@ -343,7 +353,7 @@ class Handler(BaseHTTPRequestHandler):
 
         _key, engine = get_tts(voice)
         ready: "queue.Queue" = queue.Queue()   # (i, sentence) → worker
-        out: "queue.Queue" = queue.Queue()     # (i, sentence, wav) | error ← worker
+        out: "queue.Queue" = queue.Queue()     # tuples | error ← worker
 
         def synth_worker():
             while True:
@@ -352,10 +362,22 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 i, sentence = item
                 try:
-                    with _lock:
-                        pcm, sr = tts_mod.synthesize_pcm(engine, sentence, speed, speaker)
-                    out.put((i, sentence, base64.b64encode(
-                        tts_mod.pcm_to_wav_bytes(pcm, sr)).decode()))
+                    if pcm:
+                        out.put(("sbegin", i, sentence))
+
+                        def on_frag(frag, _i=i):
+                            out.put(("pcm", _i, base64.b64encode(
+                                frag.tobytes()).decode()))
+                        with _lock:
+                            full, sr = tts_mod.synthesize_pcm_stream(
+                                engine, sentence, on_frag, speed, speaker)
+                        out.put(("send", i, round(len(full) / sr, 3)))
+                    else:
+                        with _lock:
+                            pcm_data, sr = tts_mod.synthesize_pcm(
+                                engine, sentence, speed, speaker)
+                        out.put(("chunk", i, sentence, base64.b64encode(
+                            tts_mod.pcm_to_wav_bytes(pcm_data, sr)).decode()))
                 except BaseException as e:
                     out.put(e)
 
@@ -388,10 +410,23 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if isinstance(item, BaseException):
                     raise item
-                i, sentence, wav = item
-                self._stream_line({"type": "chunk", "i": i,
-                                   "text": sentence, "audio": wav})
-                emitted += 1
+                kind = item[0]
+                if kind == "chunk":
+                    _k, i, sentence, wav = item
+                    self._stream_line({"type": "chunk", "i": i,
+                                       "text": sentence, "audio": wav})
+                    emitted += 1
+                elif kind == "sbegin":
+                    _k, i, sentence = item
+                    self._stream_line({"type": "sbegin", "i": i,
+                                       "text": sentence})
+                elif kind == "pcm":
+                    _k, i, data = item
+                    self._stream_line({"type": "pcm", "i": i, "data": data})
+                elif kind == "send":
+                    _k, i, secs = item
+                    self._stream_line({"type": "send", "i": i, "seconds": secs})
+                    emitted += 1
                 block = False  # only the first get may block
 
         parts: list[str] = []
@@ -420,19 +455,30 @@ class Handler(BaseHTTPRequestHandler):
         worker.join()
         return "".join(parts).strip(), n_sent
 
-    def _stream_reply(self, text, history, sid, voice_info, transcript=None):
-        """Shared NDJSON v2 flow for /api/ask and /api/talk: meta → live
+    def _stream_reply(self, text, history, sid, voice_info, transcript=None,
+                      pcm=False):
+        """Shared NDJSON flow for /api/ask and /api/talk: meta → live
         chunks (voice + session turn) → done. Errors mid-stream become an
-        NDJSON error line instead of an HTTP 500."""
+        NDJSON error line instead of an HTTP 500.
+
+        pcm=True upgrades to v3: meta carries pcm {rate, fragSamples} and
+        each sentence arrives as sbegin → pcm* (s16le fragments, emitted
+        during synthesis) → send instead of one WAV chunk."""
         voice, speaker, speed = voice_info["voice"], voice_info["speaker"], voice_info["speed"]
         self._stream_begin()
         meta = {"type": "meta", "voice": voice_info}
+        if pcm:
+            import tts as tts_mod
+            _key, engine = get_tts(voice)
+            rate = tts_mod._RATES.get(id(engine), 22050)
+            meta["pcm"] = {"rate": rate, "fragSamples": int(rate * 0.3)}
         if transcript is not None:
             meta["transcript"] = transcript
         self._stream_line(meta)
         try:
             reply, n_sent = self._stream_pipeline(
-                text, history, speed=speed, voice=voice, speaker=speaker)
+                text, history, speed=speed, voice=voice, speaker=speaker,
+                pcm=pcm)
         except Exception as e:
             self._stream_line({"type": "error", "message": str(e)})
             return
@@ -549,8 +595,10 @@ class Handler(BaseHTTPRequestHandler):
 
                 if payload.get("stream"):
                     # true streaming: meta goes out now, chunks hit the wire
-                    # as each sentence's TTS finishes (mid-generation)
-                    self._stream_reply(text, history, sid, voice_info)
+                    # as each sentence's TTS finishes (mid-generation);
+                    # stream:"pcm" streams raw fragments mid-synthesis
+                    self._stream_reply(text, history, sid, voice_info,
+                                       pcm=payload.get("stream") == "pcm")
                     return
 
                 import tempfile
@@ -603,7 +651,8 @@ class Handler(BaseHTTPRequestHandler):
                 assert transcript is not None  # not gated ⇒ transcript survived
 
                 self._stream_reply(transcript, history or None, sid, voice_info,
-                                   transcript=transcript)
+                                   transcript=transcript,
+                                   pcm=payload.get("stream") == "pcm")
                 return
 
             result = talk(

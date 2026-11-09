@@ -280,6 +280,50 @@ def main():
             f"chunk text not reflected in final reply: {chunks[0]['text']!r}"
         print(f"✅ /api/ask stream: {len(chunks)} wav chunks, progressive text ok")
 
+        # --- streaming TTS v3: stream:"pcm" → raw s16le fragments emitted
+        # WHILE a sentence synthesizes (sherpa callback), not after ---
+        ctype, msgs, times = stream_post("/api/ask", {
+            "text": "List three colors. Use exactly three separate sentences, "
+                    "one per color, each ending with a period.",
+            "session": "test-session-" + os.urandom(4).hex(),
+            "stream": "pcm",
+        })
+        assert "ndjson" in ctype, f"pcm stream expected ndjson, got {ctype}"
+        meta = msgs[0]
+        assert meta["type"] == "meta" and meta.get("pcm", {}).get("rate") == 22050, \
+            f"v3 meta missing pcm rate: {meta}"
+        sbegins = [m for m in msgs if m["type"] == "sbegin"]
+        sends = [m for m in msgs if m["type"] == "send"]
+        pcms = [m for m in msgs if m["type"] == "pcm"]
+        done3 = msgs[-1]
+        assert done3["type"] == "done" and done3.get("reply"), f"no done: {done3}"
+        assert len(sbegins) >= 2, \
+            f"multi-sentence reply → multiple sbegin, got {len(sbegins)}"
+        assert len(sends) == len(sbegins) == done3.get("sentences"), \
+            f"sbegin/send/done.sentences mismatch: {len(sbegins)}/{len(sends)}/{done3.get('sentences')}"
+        assert len(pcms) >= len(sbegins), \
+            "every sentence needs at least one pcm fragment"
+        total_pcm = 0
+        for m in pcms:
+            raw = base64.b64decode(m["data"])
+            assert len(raw) > 0 and len(raw) % 2 == 0, "pcm fragment not s16le"
+            total_pcm += len(raw) // 2
+        secs = sum(m["seconds"] for m in sends)
+        assert abs(total_pcm / 22050 - secs) < 0.2, \
+            f"pcm samples {total_pcm} ≉ send seconds {secs}"
+        # ordering: fragments stream BETWEEN sbegin and send of a sentence
+        i0 = sbegins[0]["i"]
+        pos_sb = next(n for n, m in enumerate(msgs)
+                      if m["type"] == "sbegin" and m["i"] == i0)
+        pos_pcm = next(n for n, m in enumerate(msgs)
+                       if m["type"] == "pcm" and m["i"] == i0)
+        pos_send = next(n for n, m in enumerate(msgs)
+                        if m["type"] == "send" and m["i"] == i0)
+        assert pos_sb < pos_pcm < pos_send, \
+            "fragments must arrive between sbegin and send"
+        print(f"✅ /api/ask stream v3 pcm: {len(sbegins)} sentences, "
+              f"{len(pcms)} fragments, {secs:.1f}s audio, rate={meta['pcm']['rate']}")
+
         # --- pre-warm: LLM tokens must arrive incrementally (that overlap
         # is what lets TTS start on sentence 1 mid-generation) ---
         from brain import ask_stream

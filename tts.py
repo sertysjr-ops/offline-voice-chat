@@ -131,6 +131,55 @@ def synthesize_pcm(tts, text, speed=1.0, speaker_id=0):
         raise RuntimeError("TTS produced no audio")
     import numpy as np
     pcm = (np.array(audio.samples) * 32767).clip(-32768, 32767).astype(np.int16)
+    note_rate(tts, audio.sample_rate)
+    return pcm, audio.sample_rate
+
+
+# Learned per-engine sample rates (id(engine) → rate) so fragment batching
+# can be time-based even though sherpa's callback doesn't carry the rate.
+# Both shipped piper models are 22050; the hint is corrected after synth.
+_RATES = {}
+
+
+def note_rate(tts_engine, rate):
+    _RATES[id(tts_engine)] = rate
+
+
+def synthesize_pcm_stream(tts, text, on_fragment, speed=1.0, speaker_id=0,
+                          frag_seconds=0.3):
+    """Like synthesize_pcm, but invokes on_fragment(int16 ndarray) with
+    ~frag_seconds of audio AS SYNTHESIS RUNS (sherpa generate callback).
+
+    Fragments cover the full utterance in order; the final flush may be
+    shorter. Returns (full int16 pcm, sample_rate) exactly like
+    synthesize_pcm, so callers can still build the whole WAV if needed.
+    """
+    import numpy as np
+    rate_hint = _RATES.get(id(tts), 22050)
+    frag_samples = max(2048, int(rate_hint * frag_seconds))
+
+    buf, buflen = [], 0
+
+    def cb(samples, _progress):
+        nonlocal buflen
+        arr = np.asarray(samples, dtype=np.float32)
+        buf.append(arr)
+        buflen += len(arr)
+        if buflen >= frag_samples:
+            joined = np.concatenate(buf)
+            buf.clear()
+            buflen = 0
+            on_fragment((joined * 32767).clip(-32768, 32767).astype(np.int16))
+        return 1  # 1 = keep generating, 0 = abort
+
+    audio = tts.generate(text, sid=speaker_id, speed=speed, callback=cb)
+    if buf:
+        joined = np.concatenate(buf)
+        on_fragment((joined * 32767).clip(-32768, 32767).astype(np.int16))
+    if audio.samples is None or len(audio.samples) == 0:
+        raise RuntimeError("TTS produced no audio")
+    note_rate(tts, audio.sample_rate)
+    pcm = (np.array(audio.samples) * 32767).clip(-32768, 32767).astype(np.int16)
     return pcm, audio.sample_rate
 
 
