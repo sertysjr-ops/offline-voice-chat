@@ -61,6 +61,20 @@ def main():
             f'curl -s -m 5 http://127.0.0.1:{port}/api/health'))
         print("health:", health)
         assert health.get("ok") is True, "health check failed"
+        assert health.get("kws", {}).get("available") is True, \
+            f"health must report KWS availability: {health}"
+
+        # --- KWS pre-warm: a background thread loads the spotter at boot,
+        # so /api/wake never pays model-load latency on its first call ---
+        t0 = time.time()
+        ready = health.get("kws", {}).get("ready") is True
+        while not ready and time.time() - t0 < 60:
+            time.sleep(0.5)
+            h2 = json.load(os.popen(
+                f'curl -s -m 5 http://127.0.0.1:{port}/api/health'))
+            ready = h2.get("kws", {}).get("ready") is True
+        assert ready, "KWS pre-warm never finished (spotter not loaded)"
+        print(f"✅ KWS pre-warm: spotter ready {time.time()-t0:.1f}s after boot")
 
         with open(os.path.join(ROOT, "test", "test.wav"), "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
@@ -629,6 +643,15 @@ def main():
                       "maybeResumeWatch", "WATCH_WINDOW_S", "stopWatch"):
             assert token in html3, f"always-on wiring missing: {token!r}"
         print("✅ index.html always-on wake-watch wiring present")
+
+        # index.html barge-in wiring: playback tracking, stream abort, the
+        # interrupt path in pollWake, and the watch-during-playback hook
+        for token in ("stopPlayback", "liveSources", "liveAudioEls",
+                      "bargeIn", "activeAbort", "bargeFlag",
+                      "watchDuringPlayback", "interrupted",
+                      "ac.signal", "echoCancellation"):
+            assert token in html3, f"barge-in wiring missing: {token!r}"
+        print("✅ index.html barge-in wiring present (abort + playback kill)")
 
         # --- pipeline.py --kws: audio-native pre-gate in the CLI ---
         # no-wake fixture → gate rejects, STT+LLM never run (fast exit)

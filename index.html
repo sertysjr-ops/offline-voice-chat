@@ -160,6 +160,18 @@ async function newChat() {
 
 /* ---------- streaming TTS playback (NDJSON chunks → AudioContext) ---------- */
 let actx = null, nextPlayTime = 0;
+/* Barge-in: every scheduled source is tracked so a wake word during
+ * playback can kill the queue instantly. liveAudioEls covers the buffered
+ * JSON path (<audio autoplay> bubbles). */
+const liveSources = new Set();
+const liveAudioEls = new Set();
+function stopPlayback() {
+  for (const s of liveSources) { try { s.onended = null; s.stop(); } catch {} }
+  liveSources.clear();
+  for (const a of liveAudioEls) { try { a.pause(); } catch {} }
+  liveAudioEls.clear();
+  nextPlayTime = 0;
+}
 function getCtx() {
   if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
   if (actx.state === 'suspended') actx.resume();
@@ -181,6 +193,8 @@ function scheduleBuf(ctx, buf) {
   const src = ctx.createBufferSource();
   src.buffer = buf;
   src.connect(ctx.destination);
+  liveSources.add(src);                    // barge-in can kill queued audio
+  src.onended = () => liveSources.delete(src);
   const now = ctx.currentTime;
   if (nextPlayTime < now) nextPlayTime = now + 0.06; // tiny gap before first chunk
   src.start(nextPlayTime);
@@ -201,18 +215,35 @@ function playPcmFrag(b64) {
   scheduleBuf(ctx, buf);
 }
 
+/* Barge-in plumbing: the in-flight streaming request gets an
+ * AbortController so a wake word mid-reply can cut the stream AND the
+ * playback queue, then open the recorder for the next command. bargeFlag
+ * tells the aborted call site's catch block "this was on purpose". */
+let activeAbort = null, bargeFlag = false;
+function bargeIn() {
+  bargeFlag = true;
+  stopPlayback();
+  if (activeAbort) { try { activeAbort.abort(); } catch {} }
+  // The aborted request's finally{} would normally clear busy — but it
+  // runs asynchronously, and startRec() early-returns while busy. Force
+  // the reset NOW so the recorder opens immediately.
+  busy = false; micBtn.disabled = false;
+}
+
 /**
  * POST with stream:"pcm". The server either answers plain JSON (wake-word
  * gate / errors / legacy) or streams NDJSON: meta (voice, transcript?,
  * pcm {rate}) → per sentence sbegin (text) → pcm* (s16le fragments,
  * playable on arrival) → send → done (full reply + counts).
  * handlers: {meta, sbegin, pcm, send, chunk, done} — awaited in arrival
- * order. chunk is the v2 WAV fallback for older servers.
+ * order. chunk is the v2 WAV fallback for older servers. signal wires
+ * the request into barge-in aborts.
  */
-async function requestMaybeStream(url, payload, handlers) {
+async function requestMaybeStream(url, payload, handlers, signal) {
   const r = await fetch(url, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ...payload, stream: 'pcm' }),
+    signal,
   });
   const ctype = r.headers.get('content-type') || '';
   if (!ctype.includes('ndjson')) {
@@ -253,9 +284,17 @@ function pcmHandlers(getBubble) {
   };
   return {
     sbegin: (m) => { grow(m.text); setStatus(`speaking… (sentence ${m.i + 1})`); },
-    pcm: (m) => playPcmFrag(m.data),
-    chunk: async (m) => { grow(m.text); setStatus(`speaking… (sentence ${m.i + 1})`); await playChunk(m.audio); },
+    pcm: (m) => { playPcmFrag(m.data); watchDuringPlayback(); },
+    chunk: async (m) => { grow(m.text); setStatus(`speaking… (sentence ${m.i + 1})`); await playChunk(m.audio); watchDuringPlayback(); },
   };
+}
+
+/* Barge-in: in always-on mode the wake watch keeps running WHILE Hermes
+ * speaks, so "hey hermes" mid-reply cuts playback and opens the mic.
+ * (The watch's mic stream is separate from playback — echoCancellation
+ * keeps it from triggering on Hermes's own voice.) */
+function watchDuringPlayback() {
+  if (alwaysOn && !wTimer && !recording) startWatch();
 }
 
 /* ---------- chat rendering ---------- */
@@ -274,6 +313,8 @@ function addMsg(who, text, audioB64) {
     const a = document.createElement('audio');
     a.controls = true; a.autoplay = true;
     a.src = URL.createObjectURL(new Blob([arr], { type: 'audio/wav' }));
+    liveAudioEls.add(a);                 // barge-in can pause these too
+    a.onended = () => liveAudioEls.delete(a);
     div.appendChild(a);
   }
   log.appendChild(div);
@@ -411,7 +452,12 @@ async function setAlwaysOn(on) {
 async function startWatch() {
   if (wTimer || !alwaysOn) return;
   try {
-    wStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // echoCancellation matters for barge-in: the watch keeps listening
+    // while Hermes speaks, and we don't want his own voice (speakers →
+    // mic) false-triggering the wake word.
+    wStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
   } catch {
     setStatus('⚠ mic denied — always-on needs the mic');
     setAlwaysOn(false);
@@ -451,7 +497,9 @@ function maybeResumeWatch(delayMs = 800) {
 }
 
 async function pollWake() {
-  if (!alwaysOn || wInFlight || recording || busy || !wCtx) return;
+  // No `busy` guard on purpose: during playback the watch IS the barge-in
+  // detector — a wake word mid-reply must be heard, not skipped.
+  if (!alwaysOn || wInFlight || recording || !wCtx) return;
   const inputRate = wCtx.sampleRate;
   const total = wChunks.reduce((n, c) => n + c.length, 0);
   if (total < inputRate * 0.8) return;          // not enough audio yet
@@ -481,7 +529,12 @@ async function pollWake() {
     if (d.awake) {
       skipGateOnce = true;               // command comes as the next utterance
       stopWatch();
-      setStatus('👂 wake word heard — say your command');
+      if (busy || liveSources.size || liveAudioEls.size) {
+        bargeIn();                       // cut the reply + playback queue
+        setStatus('⚡ interrupted — say your command');
+      } else {
+        setStatus('👂 wake word heard — say your command');
+      }
       startRec();
     }
   } catch {} finally { wInFlight = false; }
@@ -623,6 +676,7 @@ async function askTranscript(transcript, skipGate = false) {
   nextPlayTime = 0;
   let bubble = null;
   addMsg('you', transcript);
+  const ac = new AbortController(); activeAbort = ac;   // barge-in handle
   try {
     const json = await requestMaybeStream('/api/ask',
       { text: transcript, session: sessionId, handsFree: handsFree && !skipGate, ...voicePayload() },
@@ -633,7 +687,7 @@ async function askTranscript(transcript, skipGate = false) {
           if (bubble && m.reply) bubble.textNode.textContent = m.reply;
           showVoice(m.voice);
         },
-      });
+      }, ac.signal);
     if (json) {
       if (json.wakeWordHit === false) {
         ok = true;
@@ -646,8 +700,10 @@ async function askTranscript(transcript, skipGate = false) {
     setStatus(handsFree ? 'listening… (hands-free)' : 'hold SPACE to talk, or type below');
     ok = true;
   } catch (err) {
-    setStatus('⚠ ' + err.message);
+    if (bargeFlag) { bargeFlag = false; ok = true; }   // deliberate interrupt
+    else setStatus('⚠ ' + err.message);
   } finally {
+    if (activeAbort === ac) activeAbort = null;
     busy = false; micBtn.disabled = false;
     if (handsFree && ok) setTimeout(() => { if (handsFree && !busy && !recording) startRec(); }, 1200);
     if (ok) maybeResumeWatch(1200);
@@ -660,6 +716,7 @@ async function sendAudio(b64) {
   let ok = false;
   nextPlayTime = 0;
   let bubble = null, heard = 0;
+  const ac = new AbortController(); activeAbort = ac;   // barge-in handle
   try {
     const json = await requestMaybeStream('/api/talk',
       { audio: b64, session: sessionId, handsFree, ...voicePayload() },
@@ -674,7 +731,7 @@ async function sendAudio(b64) {
           if (bubble && m.reply) bubble.textNode.textContent = m.reply;
           showVoice(m.voice);
         },
-      });
+      }, ac.signal);
     if (json) {
       if (json.wakeWordHit === false) {
         // heard something, but not for us — stay quiet, don't bubble
@@ -688,8 +745,10 @@ async function sendAudio(b64) {
     setStatus(handsFree ? 'listening… (hands-free)' : 'hold SPACE to talk, or type below');
     ok = true;
   } catch (err) {
-    setStatus('⚠ ' + err.message);
+    if (bargeFlag) { bargeFlag = false; ok = true; }   // deliberate interrupt
+    else setStatus('⚠ ' + err.message);
   } finally {
+    if (activeAbort === ac) activeAbort = null;
     busy = false; micBtn.disabled = false;
     if (handsFree && ok) setTimeout(() => { if (handsFree && !busy && !recording) startRec(); }, 1200);
     if (ok) maybeResumeWatch(1200);
@@ -708,6 +767,7 @@ async function sendText() {
   nextPlayTime = 0;
   let heardChunk = false;
   let bubble = null;
+  const ac = new AbortController(); activeAbort = ac;   // barge-in handle
   try {
     const json = await requestMaybeStream('/api/ask', { text: t, session: sessionId, ...voicePayload() }, {
       meta: (m) => { bubble = addMsg('hermes', ''); showVoice(m.voice); },
@@ -716,13 +776,17 @@ async function sendText() {
         if (bubble && m.reply) bubble.textNode.textContent = m.reply;
         showVoice(m.voice);
       },
-    });
+    }, ac.signal);
     if (json && json.reply) { addMsg('hermes', json.reply, json.audio); showVoice(json.voice); }
     if (!heardChunk && !json) setStatus('no audio came back — check the server log');
     else setStatus('hold SPACE to talk, or type below');
   } catch (err) {
-    setStatus('⚠ ' + err.message);
-  } finally { busy = false; }
+    if (!bargeFlag) setStatus('⚠ ' + err.message);      // barge = deliberate
+    bargeFlag = false;
+  } finally {
+    if (activeAbort === ac) activeAbort = null;
+    busy = false;
+  }
 }
 document.getElementById('send').addEventListener('click', sendText);
 document.getElementById('newchat').addEventListener('click', newChat);

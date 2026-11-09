@@ -492,7 +492,14 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.path.join(os.path.dirname(__file__), "index.html"), "rb") as f:
                 self._send(200, f.read(), "text/html; charset=utf-8")
         elif self.path == "/api/health":
-            self._send(200, json.dumps({"ok": True, "models": {"stt": _recognizer is not None, "tts": bool(_tts_cache)}}))
+            import kws
+            self._send(200, json.dumps({
+                "ok": True,
+                "models": {"stt": _recognizer is not None,
+                           "tts": bool(_tts_cache)},
+                "kws": {"available": kws.available(),
+                        "ready": kws._spotter is not None},
+            }))
         elif self.path == "/api/voices":
             import tts as tts_mod
             voices = tts_mod.list_voices()
@@ -672,10 +679,31 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, json.dumps({"error": str(e)}))
 
 
+def _prewarm_kws():
+    """Load the KWS spotter in the background at boot.
+
+    Without this, the FIRST /api/wake call pays the model-load latency
+    (a second or more) — exactly the call the always-on browser loop and
+    the barge-in watch hammer constantly. Failures are silent: /api/wake
+    still 503s on a missing model either way.
+    """
+    try:
+        import kws
+        if kws.available():
+            with _lock:  # don't double-build against a concurrent /api/wake
+                kws.get_spotter()
+    except Exception:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--no-prewarm", action="store_true",
+                    help="don't background-load the KWS model at boot")
     args = ap.parse_args()
+    if not args.no_prewarm:
+        threading.Thread(target=_prewarm_kws, daemon=True).start()
     print(f"🎙  Hermes voice chat → http://localhost:{args.port}  (Ctrl+C to stop)")
     ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
 
