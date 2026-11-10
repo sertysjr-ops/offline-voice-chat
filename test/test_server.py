@@ -645,13 +645,79 @@ def main():
         print("✅ index.html always-on wake-watch wiring present")
 
         # index.html barge-in wiring: playback tracking, stream abort, the
-        # interrupt path in pollWake, and the watch-during-playback hook
+        # interrupt path in pollWake, and the watch-during-turn hook
         for token in ("stopPlayback", "liveSources", "liveAudioEls",
                       "bargeIn", "activeAbort", "bargeFlag",
-                      "watchDuringPlayback", "interrupted",
+                      "watchDuringTurn", "interrupted",
                       "ac.signal", "echoCancellation"):
             assert token in html3, f"barge-in wiring missing: {token!r}"
         print("✅ index.html barge-in wiring present (abort + playback kill)")
+
+        # barge-in during the THINKING phase: all three request sites start
+        # the watch at request time (not just when the first audio lands)
+        assert html3.count("watchDuringTurn()") >= 5, \
+            "watch should start at request time in ask/sendAudio/sendText"
+        print("✅ barge-in covers the thinking phase (watch starts at request time)")
+
+        # --- KWS telemetry: every wake decision is logged + rolled up ---
+        # unit-level: log/stats roundtrip against an isolated temp log, and
+        # stats() must survive a torn/garbage line in the file
+        import tempfile
+        import telemetry
+        orig_path = telemetry.LOG_PATH
+        tmp_log = os.path.join(tempfile.mkdtemp(), "tel.jsonl")
+        telemetry.LOG_PATH = tmp_log
+        try:
+            marker = "telemetry-probe-" + os.urandom(3).hex()
+            telemetry.log("stt-gate", hit=True, word="hey hermes",
+                          transcript=marker, source="unit")
+            telemetry.log("wake", awake=False, keyword=None,
+                          seconds=2.0, tookMs=12)
+            with open(tmp_log, "a", encoding="utf-8") as f:
+                f.write("{torn json line\n")  # a crashed write mid-line
+            ust = telemetry.stats()
+            assert ust["total"] == 2, f"torn line must be skipped: {ust}"
+            assert ust["sttGate"]["calls"] == 1 and \
+                ust["sttGate"]["hits"] == 1, f"stt-gate rollup: {ust}"
+            assert ust["wake"]["calls"] == 1 and ust["wake"]["hits"] == 0, \
+                f"wake rollup: {ust}"
+            assert ust["recent"][0]["event"] == "wake", \
+                f"recent must be newest-first: {ust['recent']}"
+            assert any(e.get("transcript") == marker for e in ust["recent"]), \
+                f"marker event missing from recent: {ust['recent']}"
+        finally:
+            telemetry.LOG_PATH = orig_path
+        print("✅ telemetry unit: log→stats roundtrip, torn line tolerated")
+
+        # endpoint rollup: the probes above (4 /api/wake calls, several
+        # hands-free gate decisions) must all be reflected
+        raw = subprocess.run(
+            ["curl", "-s", "-m", "10",
+             f"http://127.0.0.1:{port}/api/kws/stats"],
+            capture_output=True, text=True).stdout
+        ks = json.loads(raw)
+        assert ks.get("wake", {}).get("calls", 0) >= 4, \
+            f"wake calls not logged: {ks.get('wake')}"
+        assert ks["wake"].get("hits", 0) >= 2 and ks["wake"].get("byKeyword"), \
+            f"wake hits + per-keyword counts missing: {ks.get('wake')}"
+        assert ks.get("sttGate", {}).get("calls", 0) >= 4, \
+            f"stt-gate decisions not logged: {ks.get('sttGate')}"
+        rejects = [e for e in ks.get("recent", [])
+                   if e.get("event") == "stt-gate" and e.get("hit") is False]
+        assert rejects and all("transcript" in e and "source" in e
+                               for e in rejects), \
+            f"gate rejects must carry transcript+source: {ks.get('recent')}"
+        sources = {e.get("source") for e in ks.get("recent", [])
+                   if e.get("event") == "stt-gate"}
+        assert "ask" in sources and "talk" in sources, \
+            f"gate sources must distinguish ask/talk: {sources}"
+        wake_events = [e for e in ks.get("recent", [])
+                       if e.get("event") == "wake"]
+        assert wake_events and all(
+            "seconds" in e and "tookMs" in e for e in wake_events), \
+            f"wake events must carry duration+latency: {wake_events}"
+        print(f"✅ /api/kws/stats: wake {ks['wake']['hits']}/{ks['wake']['calls']} hits, "
+              f"gate rejectRate={ks['sttGate']['rejectRate']}, sources={sorted(sources)}")
 
         # --- pipeline.py --kws: audio-native pre-gate in the CLI ---
         # no-wake fixture → gate rejects, STT+LLM never run (fast exit)

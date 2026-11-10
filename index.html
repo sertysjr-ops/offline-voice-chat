@@ -284,16 +284,18 @@ function pcmHandlers(getBubble) {
   };
   return {
     sbegin: (m) => { grow(m.text); setStatus(`speaking… (sentence ${m.i + 1})`); },
-    pcm: (m) => { playPcmFrag(m.data); watchDuringPlayback(); },
-    chunk: async (m) => { grow(m.text); setStatus(`speaking… (sentence ${m.i + 1})`); await playChunk(m.audio); watchDuringPlayback(); },
+    pcm: (m) => { playPcmFrag(m.data); watchDuringTurn(); },
+    chunk: async (m) => { grow(m.text); setStatus(`speaking… (sentence ${m.i + 1})`); await playChunk(m.audio); watchDuringTurn(); },
   };
 }
 
-/* Barge-in: in always-on mode the wake watch keeps running WHILE Hermes
- * speaks, so "hey hermes" mid-reply cuts playback and opens the mic.
- * (The watch's mic stream is separate from playback — echoCancellation
- * keeps it from triggering on Hermes's own voice.) */
-function watchDuringPlayback() {
+/* Barge-in: in always-on mode the wake watch keeps running for the WHOLE
+ * turn — from the moment the request is sent (the thinking phase, before
+ * any audio exists) through playback — so "hey hermes" mid-thought OR
+ * mid-reply cuts the turn and opens the mic. (The watch's mic stream is
+ * separate from playback — echoCancellation keeps it from triggering on
+ * Hermes's own voice.) */
+function watchDuringTurn() {
   if (alwaysOn && !wTimer && !recording) startWatch();
 }
 
@@ -677,6 +679,7 @@ async function askTranscript(transcript, skipGate = false) {
   let bubble = null;
   addMsg('you', transcript);
   const ac = new AbortController(); activeAbort = ac;   // barge-in handle
+  watchDuringTurn();  // barge-in works during the thinking phase too
   try {
     const json = await requestMaybeStream('/api/ask',
       { text: transcript, session: sessionId, handsFree: handsFree && !skipGate, ...voicePayload() },
@@ -717,6 +720,7 @@ async function sendAudio(b64) {
   nextPlayTime = 0;
   let bubble = null, heard = 0;
   const ac = new AbortController(); activeAbort = ac;   // barge-in handle
+  watchDuringTurn();  // barge-in works during the thinking phase too
   try {
     const json = await requestMaybeStream('/api/talk',
       { audio: b64, session: sessionId, handsFree, ...voicePayload() },
@@ -768,6 +772,7 @@ async function sendText() {
   let heardChunk = false;
   let bubble = null;
   const ac = new AbortController(); activeAbort = ac;   // barge-in handle
+  watchDuringTurn();  // barge-in works during the thinking phase too
   try {
     const json = await requestMaybeStream('/api/ask', { text: t, session: sessionId, ...voicePayload() }, {
       meta: (m) => { bubble = addMsg('hermes', ''); showVoice(m.voice); },

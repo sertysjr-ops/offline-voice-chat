@@ -36,6 +36,9 @@ Serves a single-page browser UI and the voice pipeline API:
                              converges mid-speech, and the final decode is
                              ready the moment you stop talking.
     GET  /api/voices       → installed voice models + libritts speaker presets
+    GET  /api/kws/stats    → wake-word telemetry rollup: KWS hit rate,
+                             transcript-gate reject rate, per-keyword counts,
+                             recent events (data/kws-telemetry.jsonl)
     POST /api/wake         → JSON {audio: base64 16kHz mono wav}
                              → {awake: bool, keyword: string|null}
                              Audio-native wake-word detection (sherpa KWS,
@@ -225,20 +228,35 @@ def partial_transcribe(stream_id, pcm_bytes, final=False):
     return text, len(pcm) / 32000.0, True
 
 
-def apply_wake_gate(transcript, hands_free=False, wake_words=None):
-    """Hands-free gate. Returns (gated_response_or_None, cleaned_transcript)."""
+def apply_wake_gate(transcript, hands_free=False, wake_words=None,
+                    source="unknown"):
+    """Hands-free gate. Returns (gated_response_or_None, cleaned_transcript).
+
+    Every hands-free decision is telemetry-logged (stt-gate hit/reject) —
+    reject transcripts are exactly what you need to spot STT mangling the
+    wake word or KWS false-positives leaking through the pre-gate."""
     from wakeword import WAKE_WORDS, match_wake_word
 
     if not hands_free:
         return None, transcript
-    matched, command = match_wake_word(transcript, wake_words or WAKE_WORDS)
+    words = wake_words or WAKE_WORDS
+    matched, command = match_wake_word(transcript, words)
+    word = None
+    if matched:
+        lower = transcript.lower().strip()
+        word = next((w for w in words if lower.startswith(w)), None)
+    import telemetry
     if not matched:
+        telemetry.log("stt-gate", hit=False, word=None,
+                      transcript=(transcript or "")[:120], source=source)
         return {
             "transcript": transcript,
             "wakeWordHit": False,
             "reply": None,
             "audio": None,
         }, None
+    telemetry.log("stt-gate", hit=True, word=word,
+                  transcript=(transcript or "")[:120], source=source)
     # LLM hears the command, not the wake word
     return None, (command or transcript)
 
@@ -265,7 +283,8 @@ def talk(audio_b64, history, hands_free=False, wake_words=None,
     if not transcript:
         return {"transcript": "", "reply": "I didn't catch that — try again.", "audio": None}
 
-    gated, transcript = apply_wake_gate(transcript, hands_free, wake_words)
+    gated, transcript = apply_wake_gate(transcript, hands_free, wake_words,
+                                        source="talk")
     if gated:
         return gated
 
@@ -500,6 +519,13 @@ class Handler(BaseHTTPRequestHandler):
                 "kws": {"available": kws.available(),
                         "ready": kws._spotter is not None},
             }))
+        elif self.path == "/api/kws/stats":
+            # Wake-word telemetry rollup: KWS hit rate, transcript-gate
+            # reject rate, per-keyword counts, recent events. This is the
+            # false-positive tuning data — KWS hits the STT gate then
+            # rejects show up as wake:hits outnumbering stt-gate:hits.
+            import telemetry
+            self._send(200, json.dumps(telemetry.stats()))
         elif self.path == "/api/voices":
             import tts as tts_mod
             voices = tts_mod.list_voices()
@@ -569,9 +595,15 @@ class Handler(BaseHTTPRequestHandler):
                     "error": "KWS model missing — see README models section"}))
                 return
             try:
+                t0 = time.time()
                 samples = load_wav_samples(payload.get("audio") or "")
                 with _lock:  # sherpa spotters are not thread-safe
                     keyword = kws.detect(samples)
+                import telemetry
+                telemetry.log("wake", awake=keyword is not None,
+                              keyword=keyword,
+                              seconds=round(len(samples) / 16000.0, 2),
+                              tookMs=round((time.time() - t0) * 1000))
                 self._send(200, json.dumps({"awake": keyword is not None,
                                             "keyword": keyword}))
             except AssertionError as e:
@@ -590,10 +622,12 @@ class Handler(BaseHTTPRequestHandler):
             # STT path) still get the wake-word gate, server-side
             if payload.get("handsFree"):
                 gated, cleaned = apply_wake_gate(
-                    text, True, payload.get("wakeWords") or None)
+                    text, True, payload.get("wakeWords") or None,
+                    source="ask")
                 if gated:
                     self._send(200, json.dumps(gated))
                     return
+                assert cleaned is not None  # not gated ⇒ cleaned survived
                 text = cleaned
             try:
                 history, sid = _resolve_history(payload)
@@ -651,6 +685,7 @@ class Handler(BaseHTTPRequestHandler):
                     transcript,
                     bool(payload.get("handsFree")),
                     payload.get("wakeWords") or None,
+                    source="talk",
                 )
                 if gated:
                     self._send(200, json.dumps(gated))
