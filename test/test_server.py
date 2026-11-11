@@ -583,6 +583,64 @@ def main():
         assert kws.detect(kws.resample_16k(samples, sr)), "unit detect() missed"
         print("✅ kws.detect unit-level (wav → float32 → keyword)")
 
+        # --- /api/wake/keywords: runtime wake-phrase management ---
+        # keywords.txt is repo-tracked — snapshot and restore byte-exactly
+        kw_file = os.path.join(ROOT, "keywords.txt")
+        with open(kw_file, "rb") as f:
+            kw_orig = f.read()
+
+        def kw_req(method, payload=None):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/wake/keywords",
+                data=(json.dumps(payload).encode()
+                      if payload is not None else None),
+                headers={"Content-Type": "application/json"},
+                method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return r.status, json.loads(r.read().decode())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read().decode() or "{}")
+
+        try:
+            st, body = kw_req("GET")
+            assert st == 200 and body.get("keywords") == ["HEY HERMES"], \
+                f"GET keywords: {st} {body}"
+            print(f"✅ GET /api/wake/keywords: {body['keywords']}")
+
+            st, body = kw_req("POST", {"phrase": "computer"})
+            assert st == 201 and body.get("added") == "COMPUTER" and \
+                len(body.get("keywords", [])) == 2, f"POST add: {st} {body}"
+            print(f"✅ POST add 'computer' → {body['keywords']}")
+
+            st, _ = kw_req("POST", {"phrase": "hey hermes"})
+            assert st == 409, f"duplicate add should be 409, got {st}"
+            st, _ = kw_req("POST", {"phrase": "  "})
+            assert st == 400, f"empty phrase should be 400, got {st}"
+            print("✅ duplicate → 409, empty phrase → 400")
+
+            # the rebuilt spotter (done in-request) still detects
+            kw2, _ = wake_wav("wake.wav")
+            assert kw2.get("awake") is True, \
+                f"spotter broken after keyword add: {kw2}"
+            print("✅ spotter rebuilt live — wake.wav still triggers")
+
+            st, body = kw_req("DELETE", {"phrase": "computer"})
+            assert st == 200 and body.get("keywords") == ["HEY HERMES"], \
+                f"DELETE: {st} {body}"
+            st, _ = kw_req("DELETE", {"phrase": "computer"})
+            assert st == 404, f"absent phrase should be 404, got {st}"
+            st, _ = kw_req("DELETE", {"phrase": "hey hermes"})
+            assert st == 400, f"removing the last phrase should be 400, got {st}"
+            print("✅ DELETE: removed → 200, absent → 404, last-one-left → 400")
+        finally:
+            with open(kw_file, "wb") as f:
+                f.write(kw_orig)
+            kws.reset_spotter()
+        with open(kw_file, "rb") as f:
+            assert f.read() == kw_orig, "keywords.txt not restored"
+        print("✅ keywords.txt restored byte-identical (repo-tracked file)")
+
         # index.html live-partial wiring
         html3 = subprocess.run(
             ["curl", "-s", "-m", "5", f"http://127.0.0.1:{port}/"],

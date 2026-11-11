@@ -105,6 +105,87 @@ def detect_wav(path):
     return detect(resample_16k(samples, sr))
 
 
+# --- runtime keyword management -----------------------------------------
+# keywords.txt is BPE-tokenized; adding/removing phrases needs the model's
+# bpe.model + sentencepiece (venv-only dep, same as bin/gen_keywords.py).
+# After any edit the cached spotter is dropped and rebuilt so the change
+# is live without a server restart — and a broken file fails the request
+# that caused it, not the next /api/wake call minutes later.
+
+def _bpe():
+    import sentencepiece as spm
+
+    bpe_model = os.path.join(MODEL_DIR, "bpe.model")
+    if not os.path.exists(bpe_model):
+        raise RuntimeError("bpe.model missing from the KWS model dir")
+    return spm.SentencePieceProcessor(model_file=bpe_model)
+
+
+def _read_lines():
+    if not os.path.exists(KEYWORDS_FILE):
+        return []
+    with open(KEYWORDS_FILE) as f:
+        return [ln.strip() for ln in f if ln.strip()]
+
+
+def reset_spotter():
+    """Drop the cached spotter; next get_spotter() rebuilds from disk."""
+    global _spotter
+    _spotter = None
+
+
+def list_keywords():
+    """Human-readable wake phrases, detokenized via the model's bpe."""
+    sp = _bpe()
+    return [sp.decode(line.split()) for line in _read_lines()]
+
+
+def add_keyword(phrase):
+    """Tokenize + append a wake phrase. Returns the normalized phrase.
+
+    Raises ValueError on empty/untokenizable input, KeyError on duplicate.
+    """
+    phrase = " ".join((phrase or "").upper().split())
+    if not phrase:
+        raise ValueError("empty phrase")
+    sp = _bpe()
+    tokenized = " ".join(sp.encode(phrase, out_type=str))
+    if not tokenized:
+        raise ValueError(f"could not tokenize {phrase!r}")
+    lines = _read_lines()
+    if tokenized in lines:
+        raise KeyError(phrase)
+    with open(KEYWORDS_FILE, "a") as f:
+        f.write(tokenized + "\n")
+    reset_spotter()
+    get_spotter()  # rebuild NOW so a bad edit fails this request, not the next
+    return phrase
+
+
+def remove_keyword(phrase):
+    """Remove a wake phrase by its human-readable form. Returns it.
+
+    Raises KeyError when not present, ValueError when it is the last one
+    (an empty keywords file would make every /api/wake a permanent reject).
+    """
+    target = " ".join((phrase or "").upper().split())
+    if not target:
+        raise ValueError("empty phrase")
+    sp = _bpe()
+    lines = _read_lines()
+    decoded = [sp.decode(ln.split()) for ln in lines]
+    if target not in decoded:
+        raise KeyError(target)
+    if len(lines) == 1:
+        raise ValueError("cannot remove the last wake phrase")
+    kept = [ln for ln, dec in zip(lines, decoded) if dec != target]
+    with open(KEYWORDS_FILE, "w") as f:
+        f.write("\n".join(kept) + "\n")
+    reset_spotter()
+    get_spotter()
+    return target
+
+
 if __name__ == "__main__":
     import sys
 

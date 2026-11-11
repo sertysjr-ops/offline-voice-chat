@@ -45,6 +45,12 @@ Serves a single-page browser UI and the voice pipeline API:
                              3.3M params) — no STT, sub-second. This is the
                              always-on gate: cheap enough to run on every
                              mic frame. 503 when the KWS model is missing.
+    GET  /api/wake/keywords   → {keywords: [...]} human-readable wake phrases
+    POST /api/wake/keywords   → {phrase} → 201 {added, keywords} (409 dupe)
+    DELETE /api/wake/keywords → {phrase} → {removed, keywords} (404 absent,
+                                400 last-one-left). Live without restart:
+                                the spotter is rebuilt from keywords.txt
+                                inside the request that edits it.
 
     Voice prefs: per-request fields win; otherwise the session's saved
     profile applies (persisted in data/sessions.json alongside history).
@@ -526,6 +532,16 @@ class Handler(BaseHTTPRequestHandler):
             # rejects show up as wake:hits outnumbering stt-gate:hits.
             import telemetry
             self._send(200, json.dumps(telemetry.stats()))
+        elif self.path == "/api/wake/keywords":
+            import kws
+            if not kws.available():
+                self._send(503, json.dumps({
+                    "error": "KWS model missing — see README models section"}))
+                return
+            try:
+                self._send(200, json.dumps({"keywords": kws.list_keywords()}))
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}))
         elif self.path == "/api/voices":
             import tts as tts_mod
             voices = tts_mod.list_voices()
@@ -607,6 +623,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"awake": keyword is not None,
                                             "keyword": keyword}))
             except AssertionError as e:
+                self._send(400, json.dumps({"error": str(e)}))
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}))
+            return
+
+        if self.path == "/api/wake/keywords":
+            # Add a wake phrase at runtime: tokenize against the model's
+            # bpe, append to keywords.txt, rebuild the spotter in-request.
+            import kws
+            if not kws.available():
+                self._send(503, json.dumps({
+                    "error": "KWS model missing — see README models section"}))
+                return
+            try:
+                with _lock:  # serialize with in-flight /api/wake detection
+                    added = kws.add_keyword(payload.get("phrase") or "")
+                self._send(201, json.dumps({
+                    "added": added, "keywords": kws.list_keywords()}))
+            except KeyError as e:
+                self._send(409, json.dumps({"error": f"duplicate: {e.args[0]}"}))
+            except ValueError as e:
                 self._send(400, json.dumps({"error": str(e)}))
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}))
@@ -712,6 +749,35 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(result))
         except Exception as e:
             self._send(500, json.dumps({"error": str(e)}))
+
+    def do_DELETE(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(length)) if length else {}
+        except Exception:
+            self._send(400, '{"error": "bad json"}')
+            return
+
+        if self.path == "/api/wake/keywords":
+            import kws
+            if not kws.available():
+                self._send(503, json.dumps({
+                    "error": "KWS model missing — see README models section"}))
+                return
+            try:
+                with _lock:
+                    removed = kws.remove_keyword(payload.get("phrase") or "")
+                self._send(200, json.dumps({
+                    "removed": removed, "keywords": kws.list_keywords()}))
+            except KeyError:
+                self._send(404, json.dumps({"error": "no such wake phrase"}))
+            except ValueError as e:
+                self._send(400, json.dumps({"error": str(e)}))
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}))
+            return
+
+        self._send(404, '{"error": "not found"}')
 
 
 def _prewarm_kws():
